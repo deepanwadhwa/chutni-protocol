@@ -14,7 +14,7 @@ the next session from claiming a feature that was never built.
 
 All verified on macOS 15 (Darwin arm64, Apple clang 21.0.0) — **the only
 machine this has ever run on**. `make test`: 105 BLAKE3 checks, 41 conformance
-assertions, 16 CLI checks, and 25 reusable-service checks, with 0 failures and
+assertions, 16 CLI checks, and 26 reusable-service checks, with 0 failures and
 2 declared gaps. `make sanitize` re-runs the conformance, CLI, and service
 suites under ASan + UBSan, also clean.
 

@@ -218,6 +218,25 @@ static void set_scan_result(cj *object, const chutni_scan_result *scan) {
     cj_set(object, "scan", value);
 }
 
+static int set_store_counts(cj *object, chutni_store *store) {
+    chutni_counts counts;
+    if (chutni_store_counts(store, &counts) != CHUTNI_OK) return 0;
+    cj *value = cj_obj();
+    if (!value) return 0;
+    cj_set(value, "roots", cj_num((double)counts.roots));
+    cj_set(value, "sources", cj_num((double)counts.sources));
+    cj_set(value, "artifacts", cj_num((double)counts.artifacts));
+    cj_set(value, "artifacts_active",
+           cj_num((double)counts.artifacts_active));
+    cj_set(value, "artifacts_stale",
+           cj_num((double)counts.artifacts_stale));
+    cj_set(value, "objects", cj_num((double)counts.objects));
+    cj_set(value, "producers", cj_num((double)counts.producers));
+    cj_set(value, "derivations", cj_num((double)counts.derivations));
+    cj_set(object, "counts", value);
+    return 1;
+}
+
 static cj *tool_folder_status(const cj *arguments, int *is_error) {
     const char *path = argument_string(arguments, "path");
     folder_resolution resolution;
@@ -299,9 +318,6 @@ static cj *tool_folder_activate(const cj *arguments, int *is_error) {
     char store_path[PATH_MAX], store_id[CHUTNI_ID_STRLEN];
     snprintf(store_path, sizeof store_path, "%s", chutni_store_path(store));
     snprintf(store_id, sizeof store_id, "%s", chutni_store_id(store));
-    chutni_close(store);
-    if (created && argument_bool(arguments, "register", 0))
-        chutni_registry_add(store_path);
 
     cj *result = cj_obj();
     cj_set(result, "ok", cj_bool(1));
@@ -313,6 +329,17 @@ static cj *tool_folder_activate(const cj *arguments, int *is_error) {
     cj_set(result, "store_id", cj_str(store_id));
     if (root_id[0]) cj_set(result, "root_id", cj_str(root_id));
     set_scan_result(result, &scan);
+    if (!set_store_counts(result, store)) {
+        cj_free(result);
+        cj *error = status_error("Cannot read store counts", CHUTNI_ERR_DB,
+                                 store);
+        chutni_close(store);
+        *is_error = 1;
+        return error;
+    }
+    chutni_close(store);
+    if (created && argument_bool(arguments, "register", 0))
+        chutni_registry_add(store_path);
     return result;
 }
 
@@ -346,8 +373,6 @@ static cj *tool_discover(const cj *arguments, int *is_error) {
 }
 
 static cj *store_info_json(chutni_store *store) {
-    chutni_counts counts;
-    if (chutni_store_counts(store, &counts) != CHUTNI_OK) return NULL;
     chutni_root_info *roots = NULL;
     size_t root_count = 0;
     if (chutni_roots_list(store, &roots, &root_count) != CHUTNI_OK)
@@ -358,18 +383,11 @@ static cj *store_info_json(chutni_store *store) {
     cj_set(result, "store_path", cj_str(chutni_store_path(store)));
     cj_set(result, "store_id", cj_str(chutni_store_id(store)));
     cj_set(result, "spec_version", cj_str(CHUTNI_SPEC_VERSION));
-    cj *count_json = cj_obj();
-    cj_set(count_json, "roots", cj_num((double)counts.roots));
-    cj_set(count_json, "sources", cj_num((double)counts.sources));
-    cj_set(count_json, "artifacts", cj_num((double)counts.artifacts));
-    cj_set(count_json, "artifacts_active",
-           cj_num((double)counts.artifacts_active));
-    cj_set(count_json, "artifacts_stale",
-           cj_num((double)counts.artifacts_stale));
-    cj_set(count_json, "objects", cj_num((double)counts.objects));
-    cj_set(count_json, "producers", cj_num((double)counts.producers));
-    cj_set(count_json, "derivations", cj_num((double)counts.derivations));
-    cj_set(result, "counts", count_json);
+    if (!set_store_counts(result, store)) {
+        cj_free(result);
+        chutni_root_info_free(roots, root_count);
+        return NULL;
+    }
     cj *root_json = cj_arr();
     for (size_t i = 0; i < root_count; i++) {
         cj *item = cj_obj();
@@ -433,6 +451,14 @@ static cj *tool_scan(const cj *arguments, int *is_error) {
     cj_set(result, "ok", cj_bool(1));
     cj_set(result, "store_path", cj_str(chutni_store_path(store)));
     set_scan_result(result, &scan);
+    if (!set_store_counts(result, store)) {
+        cj_free(result);
+        cj *error = status_error("Cannot read store counts", CHUTNI_ERR_DB,
+                                 store);
+        chutni_close(store);
+        *is_error = 1;
+        return error;
+    }
     chutni_close(store);
     return result;
 }

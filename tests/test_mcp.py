@@ -159,6 +159,7 @@ def main():
         assert activated["created"] is True
         assert activated["store_path"] == str(store)
         assert activated["scan"]["text_artifacts"] == 1
+        assert activated["counts"]["artifacts_active"] == 1
         assert (store / "manifest.json").is_file()
         assert (store / "catalog.sqlite").is_file()
 
@@ -263,7 +264,7 @@ def main():
         assert one_shot_status["action"] == "open_store"
         assert one_shot_status["store_path"] == str(store)
 
-    print("Chutni MCP checks: 25 passed, 0 failed")
+    print("Chutni MCP checks: 26 passed, 0 failed")
 
 
 if __name__ == "__main__":
