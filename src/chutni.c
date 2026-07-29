@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1758,6 +1759,379 @@ chutni_status chutni_artifact_put(chutni_store *s, const chutni_artifact *a,
     return CHUTNI_OK;
 }
 
+/* ----------------------------------------------------------- representations */
+
+/* A stored vector is a self-describing object, so a reader that finds one
+ * without its catalog row can still tell what it is:
+ *
+ *   offset  size  meaning
+ *        0     8  magic "CHUTVEC1"
+ *        8     4  dimensions, little-endian uint32
+ *       12     1  dtype: 1 = IEEE-754 binary32
+ *       13     1  normalization: 0 = none, 1 = l2
+ *       14     2  reserved, zero
+ *       16   4*d  the vector itself, little-endian binary32
+ *
+ * Byte order is written out explicitly rather than memcpy'd wholesale, so that
+ * a store written on one architecture reads correctly on another (§26). This
+ * assumes float is IEEE-754 binary32, which holds on every platform this
+ * targets; a machine where it does not would need a conversion here rather than
+ * a bit copy. */
+#define VEC_MAGIC     "CHUTVEC1"
+#define VEC_MAGIC_LEN 8
+#define VEC_HEADER    16
+#define VEC_DTYPE_F32 1
+#define VEC_MEDIA_TYPE "application/vnd.chutni.vector"
+
+static void put_u32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t get_u32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void put_f32le(uint8_t *p, float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof bits);
+    put_u32le(p, bits);
+}
+
+static float get_f32le(const uint8_t *p) {
+    uint32_t bits = get_u32le(p);
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+static int norm_code(const char *normalization) {
+    return normalization && !strcmp(normalization, "l2") ? 1 : 0;
+}
+
+static uint8_t *vector_encode(const float *v, size_t dims, const char *normalization,
+                              size_t *len_out) {
+    size_t len = VEC_HEADER + dims * 4;
+    uint8_t *buf = calloc(1, len);
+    if (!buf) return NULL;
+    memcpy(buf, VEC_MAGIC, VEC_MAGIC_LEN);
+    put_u32le(buf + 8, (uint32_t)dims);
+    buf[12] = VEC_DTYPE_F32;
+    buf[13] = (uint8_t)norm_code(normalization);
+    for (size_t i = 0; i < dims; i++) put_f32le(buf + VEC_HEADER + i * 4, v[i]);
+    *len_out = len;
+    return buf;
+}
+
+/* Decodes into a caller-owned float array. The header's own dimension count is
+ * checked against the payload length, so a truncated object is rejected rather
+ * than read past. */
+static chutni_status vector_decode(const uint8_t *buf, size_t len, const char *normalization,
+                                   float **out, size_t *dims_out) {
+    if (len < VEC_HEADER || memcmp(buf, VEC_MAGIC, VEC_MAGIC_LEN))
+        return CHUTNI_ERR_FORMAT;
+    if (buf[12] != VEC_DTYPE_F32 || buf[13] > 1 || buf[14] || buf[15] ||
+        buf[13] != (uint8_t)norm_code(normalization)) return CHUTNI_ERR_FORMAT;
+    uint32_t dims = get_u32le(buf + 8);
+    if (!dims || (size_t)dims > (len - VEC_HEADER) / 4) return CHUTNI_ERR_FORMAT;
+    if (len - VEC_HEADER != (size_t)dims * 4) return CHUTNI_ERR_FORMAT;
+    float *v = malloc((size_t)dims * sizeof *v);
+    if (!v) return CHUTNI_ERR_NOMEM;
+    for (uint32_t i = 0; i < dims; i++) v[i] = get_f32le(buf + VEC_HEADER + i * 4);
+    *out = v;
+    *dims_out = dims;
+    return CHUTNI_OK;
+}
+
+/* The hash of what a representation was actually built from. An object-backed
+ * artifact is already content-addressed, so its object hash is that answer and
+ * costs nothing; inline text has to be hashed. */
+static chutni_status artifact_payload_hash(const char *inline_text, const char *object_hash,
+                                           char out[CHUTNI_HASH_STRLEN]) {
+    if (object_hash && *object_hash) {
+        snprintf(out, CHUTNI_HASH_STRLEN, "%s", object_hash);
+        return CHUTNI_OK;
+    }
+    if (!inline_text) return CHUTNI_ERR_FORMAT;
+    return chutni_hash_bytes(inline_text, strlen(inline_text), out);
+}
+
+static chutni_status artifact_payload_hash_of(chutni_store *s, const char *artifact_id,
+                                              char out[CHUTNI_HASH_STRLEN]) {
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT inline_text, object_hash FROM artifacts WHERE artifact_id=?1",
+            -1, &q, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    sqlite3_bind_text(q, 1, artifact_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(q) != SQLITE_ROW) {
+        sqlite3_finalize(q);
+        return fail(s, CHUTNI_ERR_NOTFOUND, "no artifact with id %s", artifact_id);
+    }
+    const unsigned char *txt = sqlite3_column_text(q, 0);
+    const unsigned char *obj = sqlite3_column_text(q, 1);
+    char text_copy[4096], obj_copy[CHUTNI_HASH_STRLEN];
+    char *heap = NULL;
+    const char *text = NULL;
+    obj_copy[0] = 0;
+    if (obj) snprintf(obj_copy, sizeof obj_copy, "%s", (const char *)obj);
+    if (txt && !obj_copy[0]) {
+        size_t n = strlen((const char *)txt);
+        if (n < sizeof text_copy) {
+            memcpy(text_copy, txt, n + 1);
+            text = text_copy;
+        } else {
+            heap = malloc(n + 1);
+            if (!heap) { sqlite3_finalize(q); return CHUTNI_ERR_NOMEM; }
+            memcpy(heap, txt, n + 1);
+            text = heap;
+        }
+    }
+    sqlite3_finalize(q);
+    chutni_status st = artifact_payload_hash(text, obj_copy, out);
+    free(heap);
+    if (st != CHUTNI_OK)
+        return fail(s, st, "artifact %s has no payload to hash", artifact_id);
+    return CHUTNI_OK;
+}
+
+chutni_status chutni_representation_put(chutni_store *s, const char *artifact_id,
+                                        const chutni_representation_profile *p,
+                                        const float *vector, size_t dimensions,
+                                        char representation_id[CHUTNI_ID_STRLEN]) {
+    if (!s || !artifact_id || !p || !vector || !representation_id) return CHUTNI_ERR_INVALID;
+    if (s->read_only) return fail(s, CHUTNI_ERR_READONLY, "store is read-only");
+    if (!dimensions) return fail(s, CHUTNI_ERR_INVALID, "a vector needs at least one dimension");
+    if (!p->representation_kind)
+        return fail(s, CHUTNI_ERR_INVALID, "representation_kind is required (§17.2)");
+
+    /* §17.1. Without these a consumer cannot tell whether the vector is usable,
+       and an unusable vector that looks usable is worse than none at all. */
+    if (!p->model_id || !p->model_revision || !p->dtype || !p->normalization ||
+        p->dimensions <= 0)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "model_id, model_revision, dimensions, dtype and normalization "
+                    "are required (§17.1)");
+    if (strcmp(p->dtype, "f32"))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "v0.1 serializes f32 vectors, not \"%s\"", p->dtype);
+    if (strcmp(p->normalization, "none") && strcmp(p->normalization, "l2"))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "normalization must be \"none\" or \"l2\", not \"%s\"", p->normalization);
+    if (p->dimensions && (size_t)p->dimensions != dimensions)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "profile declares %d dimensions but %zu were supplied",
+                    p->dimensions, dimensions);
+    if (dimensions > UINT32_MAX || dimensions > (SIZE_MAX - VEC_HEADER) / 4)
+        return fail(s, CHUTNI_ERR_INVALID, "vector dimensions are too large for v0.1 encoding");
+
+    char payload_hash[CHUTNI_HASH_STRLEN];
+    chutni_status st = artifact_payload_hash_of(s, artifact_id, payload_hash);
+    if (st != CHUTNI_OK) return st;
+
+    size_t len = 0;
+    uint8_t *blob = vector_encode(vector, dimensions, p->normalization, &len);
+    if (!blob) return CHUTNI_ERR_NOMEM;
+    char object_hash[CHUTNI_HASH_STRLEN];
+    st = chutni_object_put(s, blob, len, VEC_MEDIA_TYPE, object_hash);
+    free(blob);
+    if (st != CHUTNI_OK) return st;
+
+    if (!uuid7(representation_id)) return fail(s, CHUTNI_ERR_IO, "no entropy");
+    char now[32];
+    iso_now(now);
+
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "INSERT INTO representations(representation_id,artifact_id,representation_kind,"
+            "object_hash,model_id,model_revision,dimensions,dtype,normalization,"
+            "tokenizer_hash,projector_hash,source_artifact_hash,created_at)"
+            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", -1, &q, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    sqlite3_bind_text(q, 1, representation_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 2, artifact_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 3, p->representation_kind, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 4, object_hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 5, p->model_id, -1, SQLITE_TRANSIENT);
+    bind_text_or_null(q, 6, p->model_revision);
+    sqlite3_bind_int64(q, 7, (sqlite3_int64)dimensions);
+    sqlite3_bind_text(q, 8, p->dtype, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 9, p->normalization, -1, SQLITE_TRANSIENT);
+    bind_text_or_null(q, 10, p->tokenizer_hash);
+    bind_text_or_null(q, 11, p->projector_hash);
+    sqlite3_bind_text(q, 12, payload_hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 13, now, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(q);
+    sqlite3_finalize(q);
+    return rc == SQLITE_DONE ? CHUTNI_OK : fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+}
+
+/* Profile fields match only when both sides say the same thing, including both
+ * saying nothing. A caller that leaves a field unset has not declared it
+ * compatible, so a stored representation carrying that field is refused rather
+ * than assumed acceptable — §16.2's warning that two records sharing a
+ * marketing name need not share weights applies to every one of these. */
+static int prof_eq(const char *stored, const char *accepted) {
+    if (!stored && !accepted) return 1;
+    if (!stored || !accepted) return 0;
+    return !strcmp(stored, accepted);
+}
+
+chutni_status chutni_representation_get(chutni_store *s, const char *representation_id,
+                                        const chutni_representation_profile *accepted,
+                                        float **vector, size_t *dimensions) {
+    if (!s || !representation_id || !accepted || !vector || !dimensions)
+        return CHUTNI_ERR_INVALID;
+    *vector = NULL;
+    *dimensions = 0;
+
+    if (!accepted->representation_kind || !accepted->model_id || !accepted->dtype ||
+        !accepted->normalization || accepted->dimensions <= 0)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "the accepted profile must state representation_kind, model_id, "
+                    "dimensions, dtype and normalization (§22.6)");
+
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT representation_kind, model_id, model_revision, dimensions, dtype,"
+            "       normalization, tokenizer_hash, projector_hash, object_hash,"
+            "       source_artifact_hash, artifact_id"
+            " FROM representations WHERE representation_id=?1", -1, &q, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    sqlite3_bind_text(q, 1, representation_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(q) != SQLITE_ROW) {
+        sqlite3_finalize(q);
+        return fail(s, CHUTNI_ERR_NOTFOUND, "no representation with id %s", representation_id);
+    }
+
+    char kind[128], model[256], rev[128], dtype[32], norm[32];
+    char tok[CHUTNI_HASH_STRLEN], proj[CHUTNI_HASH_STRLEN];
+    char objhash[CHUTNI_HASH_STRLEN], srchash[CHUTNI_HASH_STRLEN], art[CHUTNI_ID_STRLEN];
+    int have_rev, have_tok, have_proj;
+#define COPY_COL(idx, buf, flag)                                                    \
+    do {                                                                            \
+        const unsigned char *v_ = sqlite3_column_text(q, (idx));                    \
+        flag = v_ != NULL;                                                          \
+        snprintf((buf), sizeof(buf), "%s", v_ ? (const char *)v_ : "");             \
+    } while (0)
+    int ignored;
+    COPY_COL(0, kind, ignored);
+    COPY_COL(1, model, ignored);
+    COPY_COL(2, rev, have_rev);
+    int dims = sqlite3_column_int(q, 3);
+    COPY_COL(4, dtype, ignored);
+    COPY_COL(5, norm, ignored);
+    COPY_COL(6, tok, have_tok);
+    COPY_COL(7, proj, have_proj);
+    COPY_COL(8, objhash, ignored);
+    COPY_COL(9, srchash, ignored);
+    COPY_COL(10, art, ignored);
+#undef COPY_COL
+    (void)ignored;
+    sqlite3_finalize(q);
+
+    if (!prof_eq(kind, accepted->representation_kind) ||
+        !prof_eq(model, accepted->model_id) ||
+        !prof_eq(have_rev ? rev : NULL, accepted->model_revision) ||
+        !prof_eq(dtype, accepted->dtype) ||
+        !prof_eq(norm, accepted->normalization) ||
+        !prof_eq(have_tok ? tok : NULL, accepted->tokenizer_hash) ||
+        !prof_eq(have_proj ? proj : NULL, accepted->projector_hash) ||
+        dims != accepted->dimensions)
+        return fail(s, CHUTNI_ERR_DENIED,
+                    "representation is %s/%s rev %s, %d-dim %s %s — the caller "
+                    "did not declare that profile acceptable (§22.6)",
+                    kind, model, have_rev ? rev : "(none)", dims, dtype, norm);
+
+    /* §17.5's rule for indexes applies to a single vector too: if the artifact
+       no longer holds the payload this was computed from, the vector describes
+       something that is gone and must be regenerated, not reinterpreted. */
+    char current[CHUTNI_HASH_STRLEN];
+    if (artifact_payload_hash_of(s, art, current) == CHUTNI_OK && strcmp(current, srchash))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "representation was computed from a payload artifact %s no longer "
+                    "holds; regenerate it (§17.5)", art);
+
+    void *data = NULL;
+    size_t len = 0;
+    chutni_status st = chutni_object_get(s, objhash, &data, &len);
+    if (st != CHUTNI_OK) return st;
+    st = vector_decode(data, len, norm, vector, dimensions);
+    free(data);
+    if (st != CHUTNI_OK)
+        return fail(s, st, "vector object %s is malformed", objhash);
+    return CHUTNI_OK;
+}
+
+chutni_status chutni_representations_list(chutni_store *s, const char *artifact_id,
+                                          chutni_representation_info **out, size_t *count) {
+    if (!s || !out || !count) return CHUTNI_ERR_INVALID;
+    *out = NULL;
+    *count = 0;
+
+    const char *sql = artifact_id
+        ? "SELECT representation_id,artifact_id,representation_kind,model_id,model_revision,"
+          " dtype,normalization,dimensions,source_artifact_hash FROM representations"
+          " WHERE artifact_id=?1 ORDER BY created_at"
+        : "SELECT representation_id,artifact_id,representation_kind,model_id,model_revision,"
+          " dtype,normalization,dimensions,source_artifact_hash FROM representations"
+          " ORDER BY created_at";
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &q, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    if (artifact_id) sqlite3_bind_text(q, 1, artifact_id, -1, SQLITE_TRANSIENT);
+
+    chutni_representation_info *vec = NULL;
+    size_t n = 0, cap = 0;
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        if (n == cap) {
+            size_t c = cap ? cap * 2 : 8;
+            chutni_representation_info *t = realloc(vec, c * sizeof *t);
+            if (!t) break;
+            vec = t;
+            cap = c;
+        }
+        chutni_representation_info *r = &vec[n];
+        memset(r, 0, sizeof *r);
+        r->representation_id   = dup_col(q, 0);
+        r->artifact_id         = dup_col(q, 1);
+        r->representation_kind = dup_col(q, 2);
+        r->model_id            = dup_col(q, 3);
+        r->model_revision      = dup_col(q, 4);
+        r->dtype               = dup_col(q, 5);
+        r->normalization       = dup_col(q, 6);
+        r->dimensions          = sqlite3_column_int(q, 7);
+        const unsigned char *sh = sqlite3_column_text(q, 8);
+        char current[CHUTNI_HASH_STRLEN];
+        r->compatible_with_artifact =
+            sh && r->artifact_id &&
+            artifact_payload_hash_of(s, r->artifact_id, current) == CHUTNI_OK &&
+            !strcmp(current, (const char *)sh);
+        n++;
+    }
+    sqlite3_finalize(q);
+    *out = vec;
+    *count = n;
+    return CHUTNI_OK;
+}
+
+void chutni_representation_info_free(chutni_representation_info *reps, size_t count) {
+    if (!reps) return;
+    for (size_t i = 0; i < count; i++) {
+        free(reps[i].representation_id);
+        free(reps[i].artifact_id);
+        free(reps[i].representation_kind);
+        free(reps[i].model_id);
+        free(reps[i].model_revision);
+        free(reps[i].dtype);
+        free(reps[i].normalization);
+    }
+    free(reps);
+}
+
 /* ------------------------------------------------------------------- search */
 
 /* User input is treated as literal terms rather than FTS5 operator syntax: a
@@ -1793,6 +2167,207 @@ static int str_in_list(const char *v, const char *const *list) {
     if (!list || !*list) return 1;
     for (const char *const *p = list; *p; p++) if (!strcmp(v, *p)) return 1;
     return 0;
+}
+
+/* What a search result may honestly claim about a hit's freshness.
+ *
+ * The two hashes are both catalog state, so they agree with each other even
+ * when the file has moved on and nothing has rescanned it — the mistake this
+ * format exists to prevent. Re-hashing every hit is too expensive for search,
+ * but a stat is not: when size or mtime no longer match what the scan recorded,
+ * the catalog's "current" is unproven.
+ *
+ * Such a result is reported "unverified", not "stale". §13.2 forbids a quick
+ * signal from establishing validity, and that cuts both ways here — touching a
+ * file changes its mtime without changing its content, so a stat cannot prove
+ * drift any more than it can prove currency. It may only withdraw a claim.
+ * Settling the question needs a re-hash: chutni_check_freshness or verify. */
+static const char *search_freshness(const char *status, const char *artifact_hash,
+                                    const char *source_hash, const char *display_path,
+                                    int64_t size_bytes, int64_t mtime_ns) {
+    if (status && strcmp(status, "active")) return "stale";
+    if (!artifact_hash || !source_hash) return "unknown";
+    if (strcmp(artifact_hash, source_hash)) return "stale";
+    if (!display_path || !*display_path) return "current";
+
+    struct stat st;
+    if (stat(display_path, &st) != 0) return "missing";
+    if ((int64_t)st.st_size != size_bytes || stat_mtime_ns(&st) != mtime_ns)
+        return "unverified";
+    return "current";
+}
+
+static int profile_matches_columns(const chutni_representation_profile *p,
+                                   const char *kind, const char *model,
+                                   const char *revision, int dimensions,
+                                   const char *dtype, const char *normalization,
+                                   const char *tokenizer_hash,
+                                   const char *projector_hash) {
+    return p && prof_eq(kind, p->representation_kind) &&
+           prof_eq(model, p->model_id) &&
+           prof_eq(revision, p->model_revision) &&
+           dimensions == p->dimensions && prof_eq(dtype, p->dtype) &&
+           prof_eq(normalization, p->normalization) &&
+           prof_eq(tokenizer_hash, p->tokenizer_hash) &&
+           prof_eq(projector_hash, p->projector_hash);
+}
+
+static int semantic_result_cmp(const void *a, const void *b) {
+    const chutni_search_result *left = a;
+    const chutni_search_result *right = b;
+    if (left->score < right->score) return 1;
+    if (left->score > right->score) return -1;
+    if (!left->artifact_id || !right->artifact_id) return 0;
+    return strcmp(left->artifact_id, right->artifact_id);
+}
+
+static void search_result_clear(chutni_search_result *r) {
+    free(r->source_id);
+    free(r->artifact_id);
+    free(r->display_path);
+    free(r->artifact_kind);
+    free(r->snippet);
+    free(r->producer_id);
+    free(r->selector_json);
+    free(r->freshness);
+    free(r->score_type);
+}
+
+chutni_status chutni_search_semantic(chutni_store *s,
+                                     const chutni_semantic_request *req,
+                                     chutni_search_result **out, size_t *count) {
+    if (!s || !req || !out || !count) return CHUTNI_ERR_INVALID;
+    *out = NULL;
+    *count = 0;
+    if (!req->vector || !req->dimensions || !req->profile ||
+        !req->profile->representation_kind || !req->profile->model_id ||
+        !req->profile->dtype || !req->profile->normalization ||
+        req->profile->dimensions <= 0 ||
+        (size_t)req->profile->dimensions != req->dimensions)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "semantic search needs a complete profile matching the query dimensions");
+    if (strcmp(req->profile->dtype, "f32"))
+        return fail(s, CHUTNI_ERR_INVALID, "v0.1 semantic search accepts f32 profiles only");
+
+    double query_norm = 0.0;
+    for (size_t i = 0; i < req->dimensions; i++) {
+        if (!isfinite(req->vector[i]))
+            return fail(s, CHUTNI_ERR_INVALID, "query vector contains a non-finite value");
+        query_norm += (double)req->vector[i] * req->vector[i];
+    }
+    query_norm = sqrt(query_norm);
+    if (!(query_norm > 0.0) || !isfinite(query_norm))
+        return fail(s, CHUTNI_ERR_INVALID, "query vector must have a nonzero norm");
+
+    int limit = req->limit > 0 ? req->limit : 20;
+    const char *sql =
+        "SELECT r.representation_id, r.representation_kind, r.model_id,"
+        "       r.model_revision, r.dimensions, r.dtype, r.normalization,"
+        "       r.tokenizer_hash, r.projector_hash, a.artifact_id, a.source_id,"
+        "       a.artifact_kind, a.inline_text, a.object_hash, a.status,"
+        "       a.source_content_hash, s.content_hash, s.size_bytes, s.mtime_ns,"
+        "       json_extract(s.locator_json,'$.display_path'), d.producer_id,"
+        "       a.selector_json, s.media_type"
+        " FROM representations r"
+        " JOIN artifacts a ON a.artifact_id=r.artifact_id"
+        " JOIN sources s ON s.source_id=a.source_id"
+        " LEFT JOIN derivations d ON d.derivation_id=a.derivation_id"
+        " ORDER BY r.created_at";
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &q, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+
+    chutni_search_result *vec = NULL;
+    size_t n = 0, cap = 0;
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        const char *status = (const char *)sqlite3_column_text(q, 14);
+        const char *kind = (const char *)sqlite3_column_text(q, 11);
+        if ((!req->include_stale && status && strcmp(status, "active")) ||
+            (kind && !str_in_list(kind, req->artifact_kinds))) continue;
+
+        const char *stored_kind = (const char *)sqlite3_column_text(q, 1);
+        const char *stored_model = (const char *)sqlite3_column_text(q, 2);
+        const char *stored_revision = (const char *)sqlite3_column_text(q, 3);
+        const char *stored_dtype = (const char *)sqlite3_column_text(q, 5);
+        const char *stored_normalization = (const char *)sqlite3_column_text(q, 6);
+        const char *stored_tokenizer = (const char *)sqlite3_column_text(q, 7);
+        const char *stored_projector = (const char *)sqlite3_column_text(q, 8);
+        if (!profile_matches_columns(req->profile, stored_kind, stored_model,
+                                     stored_revision, sqlite3_column_int(q, 4),
+                                     stored_dtype, stored_normalization,
+                                     stored_tokenizer, stored_projector)) continue;
+
+        const char *rid = (const char *)sqlite3_column_text(q, 0);
+        float *candidate = NULL;
+        size_t candidate_dims = 0;
+        chutni_status st = chutni_representation_get(s, rid, req->profile,
+                                                     &candidate, &candidate_dims);
+        if (st != CHUTNI_OK) {
+            /* A profile mismatch or a changed payload makes this representation
+             * unusable for this query; other catalog/object errors are also
+             * treated as an absent candidate so one bad row cannot corrupt the
+             * rest of a search. */
+            continue;
+        }
+
+        double candidate_norm = 0.0, dot = 0.0;
+        int finite = 1;
+        for (size_t i = 0; i < candidate_dims; i++) {
+            if (!isfinite(candidate[i])) { finite = 0; break; }
+            candidate_norm += (double)candidate[i] * candidate[i];
+            dot += (double)req->vector[i] * candidate[i];
+        }
+        if (!finite || !(candidate_norm > 0.0) || !isfinite(candidate_norm)) {
+            free(candidate);
+            continue;
+        }
+        double score = dot / (query_norm * sqrt(candidate_norm));
+        free(candidate);
+        if (!isfinite(score)) continue;
+
+        if (n == cap) {
+            size_t new_cap = cap ? cap * 2 : 16;
+            chutni_search_result *grown = realloc(vec, new_cap * sizeof *grown);
+            if (!grown) {
+                chutni_search_result_free(vec, n);
+                sqlite3_finalize(q);
+                return CHUTNI_ERR_NOMEM;
+            }
+            vec = grown;
+            cap = new_cap;
+        }
+        chutni_search_result *r = &vec[n];
+        memset(r, 0, sizeof *r);
+        const unsigned char *v;
+        v = sqlite3_column_text(q, 9);  r->artifact_id = strdup(v ? (const char *)v : "");
+        v = sqlite3_column_text(q, 10); r->source_id = strdup(v ? (const char *)v : "");
+        v = sqlite3_column_text(q, 19); r->display_path = strdup(v ? (const char *)v : "");
+        v = sqlite3_column_text(q, 11); r->artifact_kind = strdup(v ? (const char *)v : "");
+        v = sqlite3_column_text(q, 12); r->snippet = v ? strdup((const char *)v) : NULL;
+        v = sqlite3_column_text(q, 20); r->producer_id = v ? strdup((const char *)v) : NULL;
+        v = sqlite3_column_text(q, 21); r->selector_json = v ? strdup((const char *)v) : NULL;
+        r->score = score;
+        r->score_type = strdup("cosine_bruteforce");
+        r->freshness = strdup(search_freshness(
+            status,
+            (const char *)sqlite3_column_text(q, 15),
+            (const char *)sqlite3_column_text(q, 16),
+            r->display_path,
+            sqlite3_column_int64(q, 17),
+            sqlite3_column_int64(q, 18)));
+        n++;
+    }
+    sqlite3_finalize(q);
+    qsort(vec, n, sizeof *vec, semantic_result_cmp);
+    if ((int)n > limit) {
+        for (size_t i = (size_t)limit; i < n; i++) search_result_clear(&vec[i]);
+        chutni_search_result *shrunk = realloc(vec, (size_t)limit * sizeof *vec);
+        if (shrunk) vec = shrunk;
+        n = (size_t)limit;
+    }
+    *out = vec;
+    *count = n;
+    return CHUTNI_OK;
 }
 
 chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
@@ -1867,34 +2442,13 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
         r->score = -sqlite3_column_double(q, 5);
         r->score_type = strdup("bm25_fts5_negated");
 
-        const unsigned char *ah = sqlite3_column_text(q, 7);
-        const unsigned char *sh = sqlite3_column_text(q, 9);
-        const char *fresh = "unknown";
-        if (status && strcmp(status, "active")) fresh = "stale";
-        else if (ah && sh) fresh = strcmp((const char *)ah, (const char *)sh) ? "stale" : "current";
-
-        /* Both hashes above are catalog state, so they agree with each other
-           even when the file has moved on and nothing has rescanned it — the
-           mistake this format exists to prevent. Re-hashing every hit is too
-           expensive for search, but a stat is not: if size or mtime no longer
-           match what the scan recorded, the catalog's "current" is unproven.
-
-           Such a result is reported "unverified", not "stale". §13.2 forbids a
-           quick signal from establishing validity, and that cut both ways here:
-           a stat cannot prove the bytes differ either, because touching a file
-           changes mtime without changing content. So a stat may only withdraw
-           a claim, never make one. Callers who need the answer re-hash with
-           chutni_check_freshness or chutni verify. */
-        if (!strcmp(fresh, "current") && r->display_path[0]) {
-            struct stat st;
-            if (stat(r->display_path, &st) != 0) {
-                fresh = "missing";
-            } else if ((int64_t)st.st_size != sqlite3_column_int64(q, 12) ||
-                       (long long)stat_mtime_ns(&st) != (long long)sqlite3_column_int64(q, 13)) {
-                fresh = "unverified";
-            }
-        }
-        r->freshness = strdup(fresh);
+        r->freshness = strdup(search_freshness(
+            status,
+            (const char *)sqlite3_column_text(q, 7),
+            (const char *)sqlite3_column_text(q, 9),
+            r->display_path,
+            sqlite3_column_int64(q, 12),
+            sqlite3_column_int64(q, 13)));
         n++;
     }
     sqlite3_finalize(q);
@@ -1906,17 +2460,7 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
 
 void chutni_search_result_free(chutni_search_result *results, size_t count) {
     if (!results) return;
-    for (size_t i = 0; i < count; i++) {
-        free(results[i].source_id);
-        free(results[i].artifact_id);
-        free(results[i].display_path);
-        free(results[i].artifact_kind);
-        free(results[i].snippet);
-        free(results[i].producer_id);
-        free(results[i].selector_json);
-        free(results[i].freshness);
-        free(results[i].score_type);
-    }
+    for (size_t i = 0; i < count; i++) search_result_clear(&results[i]);
     free(results);
 }
 

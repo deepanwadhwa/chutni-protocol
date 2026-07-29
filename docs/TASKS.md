@@ -13,9 +13,9 @@ the next session from claiming a feature that was never built.
 ## 1. What is built
 
 All verified on macOS 15 (Darwin arm64, Apple clang 21.0.0) — **the only
-machine this has ever run on**. `make test`: 105 BLAKE3 checks, 28 conformance
-assertions, 15 CLI checks, 0 failures. `make sanitize` re-runs both suites under
-ASan + UBSan, also clean.
+machine this has ever run on**. `make test`: 105 BLAKE3 checks, 41 conformance
+assertions, 16 CLI checks, 0 failures, 2 declared gaps. `make sanitize` re-runs
+both suites under ASan + UBSan, also clean.
 
 | Area | Spec | State |
 |---|---|---|
@@ -31,7 +31,10 @@ ASan + UBSan, also clean.
 | Supersession, multi-producer artifacts | §23 | built, tested |
 | Forget modes | §24.3 | built, lightly tested |
 | Lexical search over FTS5 | §19 | built, tested |
+| Producer-supplied f32 representations and profile gating | §17, §22.6 | built, tested |
+| Brute-force cosine semantic search | §19.1 | built in C API, tested |
 | Store discovery and registry | §39 | built, tested |
+| Application Host lifecycle and cross-host handoff | §30.5, §40 | specified; reference handoff tested |
 | Reader + Producer + Search Provider conformance | §30.1–30.3 | believed met, not independently audited |
 
 Non-obvious properties worth preserving:
@@ -54,8 +57,7 @@ relevant §31 scenarios as `GAP`.
 
 | Missing | Spec | Notes |
 |---|---|---|
-| **Representations** — embeddings, token IDs, vision tokens | §17 | No API at all. Blocks semantic search. The largest single gap. |
-| **Semantic and hybrid search** | §19.1 | Only `lexical` works. `metadata`, `semantic`, `hybrid`, `image_similarity`, `relationship` are unimplemented. |
+| **Hybrid and other search modes** | §19.1 | Hybrid fusion, metadata-only, image-similarity, and relationship search are unimplemented. |
 | **Root remapping** across machines | §26 | A store copied to another computer cannot have its roots re-pointed. |
 | **`.chutnipack` transfer bundles** | §7.2 | `chutni pack` does not exist. |
 | **Relations** | §18 | Table exists; nothing writes or reads it. No `duplicate_of`, `contains`, etc. |
@@ -74,21 +76,25 @@ fails before and passes after, plus a transcript under `evidence/`.
 
 ### Phase R — representations and semantic search (§17, §19)
 
-The biggest gap and the most-requested capability. Lexical search cannot find
-"crowding agent" in a file that only says "PEG".
+R1–R3 and scenario 12 are complete. The remaining R-phase item is hybrid
+ranking; lexical search still cannot find "crowding agent" in a file that only
+says "PEG".
 
-- **R1** — `chutni_representation_put/get`, with the compatibility fields §17.1
-  requires: model id, revision, dimensions, dtype, normalization, source
-  artifact hash. Refuse to return a representation whose profile the caller has
-  not declared it accepts (§22.6).
-- **R2** — serialize vectors as objects; decide and document the on-disk format.
-- **R3** — a brute-force cosine search over stored vectors. Correctness first;
-  no ANN index yet. Report `score_type` honestly.
+- ~~**R1**~~ — **done 2026-07-29.** `chutni_representation_put/get` records
+  model id, revision, dimensions, dtype, normalization, tokenizer/projector
+  compatibility fields, and source artifact hash; incompatible profiles are
+  refused (§22.6).
+- ~~**R2**~~ — **done 2026-07-29.** Vectors are content-addressed objects using
+  the documented `CHUTVEC1` little-endian f32 format (SPEC §17.6).
+- ~~**R3**~~ — **done 2026-07-29.** The C API performs brute-force cosine search
+  over matching representations and reports `cosine_bruteforce`; there is no
+  ANN index yet.
 - **R4** — hybrid ranking that fuses lexical and semantic. §19 deliberately
   does not standardize ranking, so document the formula and keep `score_type`
   distinct from bm25's.
-- **R5** — conformance scenario 12 (representation compatibility and
-  incompatibility), which currently reports GAP.
+- ~~**R5**~~ — **done 2026-07-29.** Conformance scenario 12 now covers
+  round-trip serialization, exact profile gating, compatibility reporting, and
+  cosine ranking; it no longer reports GAP.
 
 Chutni does not compute embeddings; a producer supplies them. Keep it that way.
 
@@ -123,14 +129,31 @@ Needed before any cloud model touches a store.
 - **G3** — client authentication (§28.6) and separate authorization for
   write-capable clients (§28.7).
 
+### Phase A — application adoption (§30.5, §40)
+
+This is the generic contract every host implements. Samosa is the first
+guinea-pig client; nothing in this phase is Samosa-specific.
+
+- ~~**A1**~~ — **done 2026-07-29.** Specify the selected-folder state machine:
+  classify store vs source selection, check the adjacent `P.chutni` store,
+  create only with permission, and never overwrite collisions.
+- ~~**A2**~~ — **done 2026-07-29.** Specify the host/model responsibility
+  boundary and the complete create, open, reuse, update, retrieval, and failure
+  lifecycle.
+- ~~**A3**~~ — **done 2026-07-29.** Publish the implementation guide and add
+  conformance scenario 13 for cross-host creation, update, and round-trip reuse.
+- **A4** — add language bindings or a small transport-neutral host SDK after
+  the C guinea-pig integration identifies which convenience operations are
+  genuinely shared.
+
 ### Phase S — Samosa as reader and writer
 
-The owner's stated goal: Samosa should both read and write this format. Samosa
-has substantial extraction, OCR, and scanning code that a conforming producer
-could reuse; its **storage layer** is what differs.
+Samosa is the first §40 Application Host and conformance guinea pig. It has
+substantial extraction, OCR, scanning, and local-model code that a conforming
+producer can reuse; its **storage layer** is what differs.
 
-- **S1** — link `libchutni` into Samosa and implement discovery, so Samosa can
-  find an existing store instead of always building its own.
+- **S1** — link `libchutni` into Samosa and implement the §40 selected-folder
+  lifecycle, so selecting `P` opens `P.chutni` or offers to create it.
 - **S2** — a Samosa producer that writes conformant artifacts, with its models
   recorded as §16.2 producers (model id, revision, quantization, runtime).
 - **S3** — decide the fate of Samosa's schema-v2 sidecar: migrate it, run both,

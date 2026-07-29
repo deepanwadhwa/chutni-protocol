@@ -9,6 +9,7 @@
 
 #include "chutni.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -490,6 +491,309 @@ static void scenario_prompt_injection(void) {
     chutni_close(s);
 }
 
+/* 12. Representations are round-trippable, profile-gated, and searchable. */
+static void scenario_representation_compatibility(void) {
+    char store[512], dir[512], file[600];
+    p(store, sizeof store, "representations.chutni");
+    p(dir, sizeof dir, "representations_src");
+    mkdir(dir, 0700);
+    snprintf(file, sizeof file, "%s/source.txt", dir);
+    write_file(file, "representation fixture\n");
+
+    chutni_store *s = NULL;
+    if (chutni_create(store, NULL, &s) != CHUTNI_OK) {
+        bad("12 representation compatibility", "store create failed");
+        return;
+    }
+    char root_id[CHUTNI_ID_STRLEN], source_id[CHUTNI_ID_STRLEN];
+    chutni_root_add(s, dir, NULL, NULL, root_id);
+    if (chutni_source_put(s, root_id, file, 1, source_id, NULL) != CHUTNI_OK) {
+        bad("12 representation compatibility", "source put failed");
+        chutni_close(s);
+        return;
+    }
+
+    char source_hash[CHUTNI_HASH_STRLEN];
+    chutni_hash_file(file, source_hash);
+    const char *texts[] = { "north", "east", "south", "other model" };
+    const float vectors[][3] = {
+        { 1.0f, 0.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+        {-1.0f, 0.0f, 0.0f },
+        { 0.0f, 0.0f, 1.0f }
+    };
+    char artifact_ids[4][CHUTNI_ID_STRLEN];
+    char representation_ids[4][CHUTNI_ID_STRLEN];
+    for (int i = 0; i < 4; i++) {
+        chutni_artifact a;
+        memset(&a, 0, sizeof a);
+        a.source_id = source_id;
+        a.artifact_kind = "embedding_text";
+        a.artifact_origin = "deterministic_transform";
+        a.media_type = "text/plain";
+        a.inline_text = texts[i];
+        a.source_content_hash = source_hash;
+        if (chutni_artifact_put(s, &a, artifact_ids[i]) != CHUTNI_OK) {
+            bad("12 representation compatibility", "artifact put failed");
+            chutni_close(s);
+            return;
+        }
+    }
+
+    chutni_representation_profile profile;
+    memset(&profile, 0, sizeof profile);
+    profile.representation_kind = "text_embedding";
+    profile.model_id = "toy-embed";
+    profile.model_revision = "r1";
+    profile.dimensions = 3;
+    profile.dtype = "f32";
+    profile.normalization = "none";
+    profile.tokenizer_hash = "tok-a";
+
+    for (int i = 0; i < 3; i++) {
+        if (chutni_representation_put(s, artifact_ids[i], &profile,
+                                      vectors[i], 3, representation_ids[i]) != CHUTNI_OK) {
+            bad("12 representation compatibility", "representation put failed");
+            chutni_close(s);
+            return;
+        }
+    }
+
+    chutni_representation_profile other = profile;
+    other.model_id = "other-embed";
+    check("12 incompatible representation can be stored",
+          chutni_representation_put(s, artifact_ids[3], &other, vectors[3], 3,
+                                    representation_ids[3]) == CHUTNI_OK,
+          "profile remains data, not a global singleton");
+
+    float *roundtrip = NULL;
+    size_t dimensions = 0;
+    chutni_status got = chutni_representation_get(s, representation_ids[0],
+                                                   &profile, &roundtrip, &dimensions);
+    check("12 representation vector round-trips",
+          got == CHUTNI_OK && dimensions == 3 && roundtrip &&
+          fabsf(roundtrip[0] - 1.0f) < 0.0001f &&
+          fabsf(roundtrip[1]) < 0.0001f && fabsf(roundtrip[2]) < 0.0001f,
+          "serialized f32 object");
+    chutni_free(roundtrip);
+
+    chutni_representation_profile wrong = profile;
+    wrong.model_revision = "r2";
+    check("12 incompatible profile is refused",
+          chutni_representation_get(s, representation_ids[0], &wrong,
+                                    &roundtrip, &dimensions) == CHUTNI_ERR_DENIED,
+          "§22.6 exact compatibility gating");
+
+    chutni_representation_info *infos = NULL;
+    size_t info_count = 0;
+    chutni_representations_list(s, NULL, &infos, &info_count);
+    int all_compatible = info_count == 4;
+    for (size_t i = 0; i < info_count; i++) all_compatible &= infos[i].compatible_with_artifact;
+    check("12 representation list reports compatibility", all_compatible,
+          "§17.5 source artifact hash");
+    chutni_representation_info_free(infos, info_count);
+
+    chutni_semantic_request request;
+    memset(&request, 0, sizeof request);
+    const float query[] = { 1.0f, 0.0f, 0.0f };
+    request.vector = query;
+    request.dimensions = 3;
+    request.profile = &profile;
+    request.limit = 3;
+    chutni_search_result *results = NULL;
+    size_t result_count = 0;
+    chutni_search_semantic(s, &request, &results, &result_count);
+    int ranked = result_count == 3 && results &&
+                 results[0].snippet && !strcmp(results[0].snippet, "north") &&
+                 results[0].score > 0.999 && results[1].snippet &&
+                 !strcmp(results[1].snippet, "east") && fabs(results[1].score) < 0.0001 &&
+                 results[2].snippet && !strcmp(results[2].snippet, "south") &&
+                 results[2].score < -0.999;
+    check("12 semantic search gates and ranks", ranked,
+          "cosine_bruteforce; incompatible model excluded");
+    int honest_type = result_count == 3;
+    for (size_t i = 0; i < result_count; i++)
+        honest_type &= results[i].score_type && !strcmp(results[i].score_type, "cosine_bruteforce");
+    check("12 semantic score type is explicit", honest_type, "§19.3");
+    chutni_search_result_free(results, result_count);
+    chutni_close(s);
+}
+
+/* 13. Two independent application hosts hand one selected folder back and
+ * forth through the protocol-defined store, with no private migration. */
+static void scenario_application_handoff(void) {
+    char dir[512], store_path[544], file[600];
+    p(dir, sizeof dir, "handoff_root");
+    mkdir(dir, 0700);
+    snprintf(store_path, sizeof store_path, "%s.chutni", dir);
+    snprintf(file, sizeof file, "%s/notes.txt", dir);
+    write_file(file, "Marsupials carry their young in a pouch.\n");
+
+    /* Host A receives an ordinary source selection P. The §40 default is the
+       adjacent sibling P.chutni, which it creates after user permission. */
+    chutni_store *host_a = NULL;
+    if (chutni_create(store_path, "handoff", &host_a) != CHUTNI_OK) {
+        bad("13 host A creates selected-folder store", chutni_last_error(NULL));
+        return;
+    }
+    char root_id[CHUTNI_ID_STRLEN], source_id[CHUTNI_ID_STRLEN];
+    int created_root = chutni_root_add(host_a, dir, "selected folder", NULL,
+                                       root_id) == CHUTNI_OK;
+    check("13 selected P maps to adjacent P.chutni", created_root,
+          "§40.2-§40.3");
+    if (!created_root ||
+        chutni_source_put(host_a, root_id, file, 1, source_id, NULL) != CHUTNI_OK) {
+        bad("13 host A indexes selected folder", "source setup failed");
+        chutni_close(host_a);
+        return;
+    }
+
+    char source_hash[CHUTNI_HASH_STRLEN];
+    chutni_hash_file(file, source_hash);
+    chutni_producer parser;
+    memset(&parser, 0, sizeof parser);
+    parser.producer_kind = "parser";
+    parser.name = "Host A text parser";
+    parser.app_name = "host-a";
+    parser.app_version = "1.0";
+    char parser_id[CHUTNI_ID_STRLEN], parser_derivation[CHUTNI_ID_STRLEN];
+    chutni_producer_put(host_a, &parser, parser_id);
+    chutni_derivation_put(host_a, parser_id, "extract_text", "recipe:plain-v1",
+                          "{}", "[]", parser_derivation);
+
+    chutni_artifact extracted;
+    memset(&extracted, 0, sizeof extracted);
+    extracted.source_id = source_id;
+    extracted.artifact_kind = "extracted_text";
+    extracted.artifact_origin = "deterministic_transform";
+    extracted.media_type = "text/plain";
+    extracted.inline_text = "Marsupials carry their young in a pouch.";
+    extracted.source_content_hash = source_hash;
+    extracted.derivation_id = parser_derivation;
+    char old_artifact_id[CHUTNI_ID_STRLEN];
+    chutni_artifact_put(host_a, &extracted, old_artifact_id);
+    chutni_rebuild_indexes(host_a);
+    chutni_close(host_a);
+
+    /* Host B is a different application. It knows only the protocol and the
+       selected folder, opens the adjacent store, and reuses Host A's artifact. */
+    chutni_store *host_b = NULL;
+    if (chutni_open(store_path, 1, &host_b) != CHUTNI_OK) {
+        bad("13 host B opens host A store", chutni_last_error(NULL));
+        return;
+    }
+    chutni_search_request request;
+    memset(&request, 0, sizeof request);
+    request.query = "marsupials pouch";
+    request.limit = 5;
+    chutni_search_result *results = NULL;
+    size_t result_count = 0;
+    chutni_search(host_b, &request, &results, &result_count);
+    check("13 host B reuses host A artifact",
+          result_count == 1 && results[0].snippet &&
+          strstr(results[0].snippet, "Marsupials"),
+          "no migration or private schema knowledge");
+    chutni_search_result_free(results, result_count);
+
+    chutni_artifact_info *old_infos = NULL;
+    size_t old_count = 0;
+    chutni_list_artifacts(host_b, source_id, &old_infos, &old_count);
+    int provenance_visible = old_count == 1 && old_infos[0].producer_name &&
+                             !strcmp(old_infos[0].producer_name,
+                                     "Host A text parser");
+    check("13 host A provenance survives handoff", provenance_visible, "§16");
+    chutni_artifact_info_free(old_infos, old_count);
+    chutni_close(host_b);
+
+    /* The file changes. Host B opens with write authorization, refreshes the
+       source, and records output from its own model with exact provenance. */
+    write_file(file, "Cephalopods change color using chromatophores.\n");
+    if (chutni_open(store_path, 0, &host_b) != CHUTNI_OK) {
+        bad("13 host B updates host A store", chutni_last_error(NULL));
+        return;
+    }
+    const char *freshness = NULL;
+    chutni_source_refresh(host_b, source_id, &freshness);
+    check("13 host B records source change",
+          freshness && !strcmp(freshness, "stale"), "§13.3, §40.5");
+
+    char new_source_hash[CHUTNI_HASH_STRLEN];
+    chutni_hash_file(file, new_source_hash);
+    chutni_producer model;
+    memset(&model, 0, sizeof model);
+    model.producer_kind = "model";
+    model.name = "Host B local model";
+    model.model_id = "example/local-model";
+    model.model_revision = "revision-1";
+    model.runtime = "host-b-local-runtime";
+    model.app_name = "host-b";
+    model.app_version = "2.0";
+    char model_id[CHUTNI_ID_STRLEN], model_derivation[CHUTNI_ID_STRLEN];
+    chutni_producer_put(host_b, &model, model_id);
+    char input_refs[128];
+    snprintf(input_refs, sizeof input_refs,
+             "[{\"source_id\":\"%s\"}]", source_id);
+    chutni_derivation_put(host_b, model_id, "summarize", "recipe:summary-v1",
+                          "{\"max_tokens\":64}", input_refs,
+                          model_derivation);
+
+    chutni_artifact summary;
+    memset(&summary, 0, sizeof summary);
+    summary.source_id = source_id;
+    summary.artifact_kind = "summary_short";
+    summary.artifact_origin = "model_generated";
+    summary.media_type = "text/plain";
+    summary.inline_text = "The updated note discusses cephalopod color change.";
+    summary.source_content_hash = new_source_hash;
+    summary.derivation_id = model_derivation;
+    char new_artifact_id[CHUTNI_ID_STRLEN];
+    chutni_artifact_put(host_b, &summary, new_artifact_id);
+    chutni_rebuild_indexes(host_b);
+    chutni_close(host_b);
+
+    /* Host A returns later and sees Host B's update through the same reader. */
+    if (chutni_open(store_path, 1, &host_a) != CHUTNI_OK) {
+        bad("13 host A reopens updated store", chutni_last_error(NULL));
+        return;
+    }
+    memset(&request, 0, sizeof request);
+    request.query = "cephalopod color";
+    request.limit = 5;
+    results = NULL;
+    result_count = 0;
+    chutni_search(host_a, &request, &results, &result_count);
+    int new_visible = result_count == 1 && results[0].artifact_id &&
+                      !strcmp(results[0].artifact_id, new_artifact_id);
+    check("13 host A reads host B update", new_visible,
+          "cross-host round trip");
+    chutni_search_result_free(results, result_count);
+
+    memset(&request, 0, sizeof request);
+    request.query = "marsupials pouch";
+    request.limit = 5;
+    results = NULL;
+    result_count = 0;
+    chutni_search(host_a, &request, &results, &result_count);
+    check("13 stale host A artifact stays withdrawn", result_count == 0,
+          "§15.4 current artifacts only");
+    chutni_search_result_free(results, result_count);
+
+    chutni_artifact_info *new_infos = NULL;
+    size_t new_count = 0;
+    chutni_list_artifacts(host_a, source_id, &new_infos, &new_count);
+    int model_visible = 0;
+    for (size_t i = 0; i < new_count; i++)
+        if (new_infos[i].artifact_id &&
+            !strcmp(new_infos[i].artifact_id, new_artifact_id) &&
+            new_infos[i].model_id &&
+            !strcmp(new_infos[i].model_id, "example/local-model"))
+            model_visible = 1;
+    check("13 host B model provenance survives handoff", model_visible,
+          "§16.2, §40.5");
+    chutni_artifact_info_free(new_infos, new_count);
+    chutni_close(host_a);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: conformance <work-dir>\n"); return 2; }
     snprintf(root_dir, sizeof root_dir, "%s", argv[1]);
@@ -509,7 +813,8 @@ int main(int argc, char **argv) {
     scenario_invalid_hashes();
     scenario_path_encoding();
     scenario_prompt_injection();
-    gap("12 representation compatibility", "representations have no API yet (§17)");
+    scenario_representation_compatibility();
+    scenario_application_handoff();
 
     printf("\n%d passed, %d failed, %d gaps\n", passes, failures, gaps);
     if (gaps) printf("Gaps are unimplemented scenarios, not passes.\n");

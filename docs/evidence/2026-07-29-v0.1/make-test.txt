@@ -43,9 +43,21 @@ Chutni conformance suite — SPEC.md §31 (spec 0.1, library 0.1.0)
   pass  10 awkward filenames resolve back              
   pass  11 injection text retrievable as data          §6.5
   pass  11 result attributed to its file               consumer can see the origin
-  GAP   12 representation compatibility                representations have no API yet (§17)
+  pass  12 incompatible representation can be stored   profile remains data, not a global singleton
+  pass  12 representation vector round-trips           serialized f32 object
+  pass  12 incompatible profile is refused             §22.6 exact compatibility gating
+  pass  12 representation list reports compatibility   §17.5 source artifact hash
+  pass  12 semantic search gates and ranks             cosine_bruteforce; incompatible model excluded
+  pass  12 semantic score type is explicit             §19.3
+  pass  13 selected P maps to adjacent P.chutni        §40.2-§40.3
+  pass  13 host B reuses host A artifact               no migration or private schema knowledge
+  pass  13 host A provenance survives handoff          §16
+  pass  13 host B records source change                §13.3, §40.5
+  pass  13 host A reads host B update                  cross-host round trip
+  pass  13 stale host A artifact stays withdrawn       §15.4 current artifacts only
+  pass  13 host B model provenance survives handoff    §16.2, §40.5
 
-28 passed, 0 failed, 3 gaps
+41 passed, 0 failed, 2 gaps
 Gaps are unimplemented scenarios, not passes.
 
 Chutni CLI checks
@@ -61,9 +73,10 @@ Chutni CLI checks
   pass  inspect shows provenance
   pass  verify reports all current
   pass  empty store refuses to scan without a root
+  pass  edited file is not called current before verify
   pass  stale content withdrawn after verify
   pass  rescan picks up new content
   pass  ambiguous store selection refuses to guess
   pass  unregister removes a store from discovery
 
-15 passed, 0 failed
+16 passed, 0 failed

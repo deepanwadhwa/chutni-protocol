@@ -34,16 +34,17 @@ Honest summary of what runs today, on one machine (macOS 15 / arm64, Apple M3).
 | Store layout, manifest, catalog schema (§8–§10) | built, tested |
 | BLAKE3 content addressing (§13, §14) | built, verified against the official vectors |
 | Sources, artifacts, producers, derivations (§12, §15, §16) | built, tested |
-| Freshness and staleness (§13.3) | built, tested |
+| Freshness and staleness (§13.2–§13.3) | built, tested; search uses a cheap stat downgrade |
 | Supersession and multi-producer artifacts (§23) | built, tested |
 | Lexical search, FTS5 (§19) | built, tested |
 | Store discovery and registry (§39) | built, tested |
 | Forget modes (§24.3) | built, lightly tested |
-| Representations — embeddings, token IDs (§17) | **not built** |
+| Representations — f32 embeddings (§17) | built, tested; producer-supplied vectors |
 | Root remapping across machines (§26) | **not built** |
 | `.chutnipack` transfer bundles (§7.2) | **not built** |
 | Image, audio, spreadsheet ingestion (§25.2–§25.4) | **not built** |
-| Semantic and hybrid search (§19.1) | **not built** — lexical only |
+| Semantic search (§19.1) | built in the C API as brute-force cosine; hybrid search is not built |
+| Application Host lifecycle (§30.5, §40) | specified, documented, handoff scenario tested |
 
 `make test` reports the unbuilt conformance scenarios as GAP rather than
 counting them as passes. Verified only on macOS 15 / arm64 (Apple M3) — the
@@ -86,8 +87,17 @@ Every command takes `--json`, because the main consumers are agents.
 
 ## For AI applications
 
-An application should **search before it creates**. If a store already exists,
-use it rather than building a second copy of the same memory:
+The application implements Chutni; the language model does not write the store
+itself. When a user selects an ordinary folder `P`, a conforming host checks for
+the adjacent `P.chutni` store. It opens and reuses that store when present, or
+offers to create it, add `P` as an authorized root, and scan it when absent.
+
+The complete host lifecycle is normative in [SPEC §40](SPEC.md), with a
+practical implementation guide in
+[docs/ADOPTING_CHUTNI.md](docs/ADOPTING_CHUTNI.md).
+
+An application should also **search before it creates**. If a store already
+exists elsewhere, use it rather than building a second copy of the same memory:
 
 ```sh
 chutni discover --json

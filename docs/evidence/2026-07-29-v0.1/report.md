@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29
 **Machine:** MacBook Air, Apple M3, macOS 15 (Darwin arm64), Apple clang 21.0.0
-**Commit:** initial implementation of SPEC.md v0.1-draft
+**Commit:** baseline `6421153`; evidence refreshed in the working tree
 
 **This is the only machine Chutni has ever run on.** No Linux, no Windows, no
 x86. Nothing here supports a claim about any other platform.
@@ -39,14 +39,18 @@ vectors on each target.
 ## 2. Conformance suite — SPEC.md §31
 
 ```
-28 passed, 0 failed, 3 gaps
+41 passed, 0 failed, 2 gaps
 ```
 
 Covered: 1 (minimal store), 2 (unknown extension fields preserved across a
 rewrite), 4 (changed source → stale), 5 (multiple producers, supersession,
 human-authored artifacts, provenance), 6 (shared content-addressed objects), 7
 (deleted/missing sources), 9 (invalid and corrupt object hashes), 10
-(path-encoding edge cases), 11 (prompt-injection text treated as data).
+(path-encoding edge cases), 11 (prompt-injection text treated as data), and 12
+(representation round-trip, exact compatibility gating, compatibility status,
+and brute-force cosine ranking), and 13 (selected-folder store creation,
+cross-host reuse, source update, stale withdrawal, and model provenance
+handoff).
 
 **Reported as GAP, not passing:**
 
@@ -54,10 +58,21 @@ human-authored artifacts, provenance), 6 (shared content-addressed objects), 7
 |---|---|
 | 3 — moved root | root remapping not implemented (§26) |
 | 8 — image/spreadsheet/audio | only text extraction exists (§25.2–25.4) |
-| 12 — representation compatibility | representations have no API (§17) |
 
-Scenario 12 is worth singling out: §17 is the whole model-compatibility story,
-and none of it is built.
+Scenario 12 is worth singling out: it verifies that a vector can be stored and
+read back, but only by a consumer declaring the exact model/profile it accepts.
+The semantic search test also proves that a representation from another model
+is excluded and that the returned `score_type` is `cosine_bruteforce`.
+
+Scenario 13 exercises the §40 Application Host lifecycle. Host A receives a
+source directory `P`, creates the adjacent `P.chutni`, records extracted text
+and parser provenance, and closes it. Host B opens that store without migration,
+reuses the artifact, observes a source edit, marks the old artifact stale, and
+records a new model-generated artifact. Host A then reopens the store, sees Host
+B's artifact and model provenance, and cannot retrieve the stale content by
+default. Both hosts use the reference library in this suite; an independent
+second implementation is still required before claiming cross-implementation
+interoperability.
 
 ### What scenario 11 does and does not prove
 
@@ -72,7 +87,7 @@ that is the consumer's obligation under §6.5, and this suite cannot test it.
 ## 3. CLI checks
 
 ```
-15 passed, 0 failed
+16 passed, 0 failed
 ```
 
 Includes the two regressions described below, plus: discovery on a fresh
@@ -80,10 +95,11 @@ machine reports nothing rather than erroring; a store with no authorized root
 refuses to scan rather than wandering the filesystem; ambiguous store selection
 refuses to guess between two stores.
 
-## 4. Two defects found and fixed while building
+## 4. Four implementation findings fixed while building
 
-Both are the same mistake — trusting cached state over the bytes on disk — and
-the second was introduced while fixing the first.
+The first two are the same mistake — trusting cached state over the bytes on
+disk — and the second was introduced while fixing the first. The later findings
+cover the new representation/search surface.
 
 ### 4.1 Stale artifacts reported themselves current
 
@@ -129,6 +145,22 @@ still need extracting?" Those come apart the moment anything else updates the
 source hash. `changed` now means **no active artifact describes these exact
 bytes**.
 
+### 4.3 Search now downgrades on cheap disk drift
+
+Search still avoids re-hashing every hit, but it now stats the source path and
+compares size and nanosecond mtime with the scan record. A mismatch reports
+`freshness: unverified`; it cannot claim `stale` without the re-hash performed
+by `verify`. The CLI regression edits an indexed file and confirms that search
+does not call the old result `current` before verification.
+
+### 4.4 Representations and semantic search
+
+The reference library now exposes producer-supplied f32 representation put/get
+and listing APIs. Vectors are content-addressed `CHUTVEC1` objects, and reads
+refuse mismatched model, revision, dimensions, dtype, normalization, tokenizer,
+or projector profiles. Semantic search is deliberately brute-force cosine and
+reports `cosine_bruteforce`; no approximate index or hybrid fusion is claimed.
+
 ## 5. Real-file run
 
 Not a fixture: Samosa's own documentation directory.
@@ -172,8 +204,8 @@ anecdote, not a measurement.
 unsanitized objects are never mixed.
 
 ```
-28 passed, 0 failed, 3 gaps      (conformance, ASan + UBSan)
-15 passed, 0 failed              (CLI checks, ASan + UBSan)
+41 passed, 0 failed, 2 gaps      (conformance, ASan + UBSan)
+16 passed, 0 failed              (CLI checks, ASan + UBSan)
 ```
 
 No leaks, no invalid accesses, no undefined behavior reported across either

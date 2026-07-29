@@ -729,6 +729,29 @@ Indexes MAY be built from representations or artifacts. Index format is implemen
 
 An index MUST be treated as invalid if any of its declared source artifacts or representations have changed.
 
+### 17.6 Reference vector object encoding
+
+The v0.1 C reference implementation stores f32 vectors as content-addressed
+objects with media type `application/vnd.chutni.vector`. This encoding is
+implementation-defined; consumers MUST use the representation catalog fields,
+not the object bytes alone, to decide compatibility.
+
+The object is little-endian and has this fixed layout:
+
+| Offset | Size | Meaning |
+|---:|---:|---|
+| 0 | 8 | ASCII magic `CHUTVEC1` |
+| 8 | 4 | unsigned 32-bit dimension count |
+| 12 | 1 | dtype code `1` (`f32`, IEEE-754 binary32) |
+| 13 | 1 | normalization code `0` = `none`, `1` = `l2` |
+| 14 | 2 | reserved; zero in v0.1 |
+| 16 | 4 × dimensions | IEEE-754 binary32 values, little-endian |
+
+The payload length MUST be exactly `16 + 4 × dimensions`; readers MUST reject
+unknown magic, dtype codes, truncated payloads, and trailing bytes. The object
+hash covers the complete encoded byte sequence. Other implementations MAY use
+another object encoding if their catalog and media type identify it clearly.
+
 ## 18. Relationships
 
 Chutni may represent relationships using `relations`.
@@ -1100,9 +1123,24 @@ A Gateway MUST expose read operations and enforce disclosure policies.
 
 A write-capable gateway MUST require explicit authorization.
 
-### 30.5 Chutni Full Implementation
+### 30.5 Chutni Application Host
 
-A Full Implementation includes Producer, Reader, Search Provider, and Gateway capabilities.
+An Application Host integrates Chutni into an application that runs or calls a
+language model. It MUST implement the selected-directory lifecycle in §40.
+
+A read-only Application Host MUST satisfy Reader requirements. A host that
+claims it can create or update memory MUST also satisfy Producer requirements.
+A host that retrieves memory for a model MUST satisfy Search Provider
+requirements.
+
+The host application, not the language model, owns the protocol boundary. Model
+output becomes part of a Chutni store only when the host records it as a valid
+artifact with the required producer and derivation provenance.
+
+### 30.6 Chutni Full Implementation
+
+A Full Implementation includes Producer, Reader, Search Provider, Application
+Host, and Gateway capabilities.
 
 ## 31. Conformance tests
 
@@ -1120,6 +1158,9 @@ The Chutni project SHOULD publish a test suite containing:
 10. Path-encoding edge cases.
 11. Prompt-injection text that consumers must treat as data.
 12. Representation compatibility and incompatibility cases.
+13. An application-handoff scenario in which one host creates memory for a
+    selected directory, a second host reads and updates it, and the first host
+    can read the update without migration.
 
 A conforming implementation SHOULD publish which conformance level and optional capabilities it passes.
 
@@ -1404,3 +1445,168 @@ Discovery reports that memory exists. It does not establish that the memory is
 current (§13), that its artifacts are correct (§4.2, §6.2), or that the
 requesting application is entitled to read it (§27). A consumer MUST perform
 those checks separately.
+
+## 40. Host-application lifecycle
+
+This section is the normative entry point for adding Chutni to an AI
+application. Samosa, ChatGPT, Claude, LM Studio, and any other host follow the
+same lifecycle. The transport and model are irrelevant to the store format.
+
+### 40.1 Responsibility boundary
+
+The **host application** MUST perform store discovery, validation, creation,
+catalog updates, freshness checks, permission enforcement, and provenance
+recording. It MAY do so through a conforming library, a local service, a
+gateway, or its own implementation of this specification.
+
+The **language model** MAY choose search terms, rank candidates, or produce
+derived text or vectors. It MUST NOT be relied upon to construct SQL, invent
+catalog rows, decide permissions, or declare its own output current. Before
+model output is committed, the host MUST validate it and create the producer,
+derivation, artifact, and representation records required by §§15–17.
+
+An unmodified application does not gain Chutni support merely because a store
+exists. The application or an authorized adapter must implement this lifecycle.
+
+### 40.2 Resolving a user-selected directory
+
+When a user selects a directory, the host MUST first classify the selection:
+
+1. If the selected directory contains a readable `manifest.json` whose
+   `format` is `chutni`, it is a **store selection**. The host MUST validate and
+   open that store. It MUST NOT infer that the store's parent directory is a
+   source root.
+2. Otherwise it is a **source selection**. The selected directory is a root the
+   user may authorize for indexing.
+
+For a source selection with canonical absolute path `P`, the interoperable
+default store path is the adjacent sibling formed by appending `.chutni` to
+`P`. For example:
+
+```text
+/Users/deepan/Research/          source selection
+/Users/deepan/Research.chutni/  default store
+```
+
+The host MUST check that adjacent path before offering to create anything. It
+MAY also offer:
+
+* a previously user-approved association for the same source directory;
+* a store discovered through §39 whose root records identify the selected
+  directory; or
+* another store path explicitly selected by the user.
+
+If exactly one valid, supported store is associated with the source selection,
+the host SHOULD open it. If multiple stores claim the same root, the host MUST
+ask the user which one to use and MUST NOT merge or choose silently.
+
+A source selection and a store selection are different permissions. Selecting
+a source directory does not authorize access to unrelated roots in a
+multi-root store.
+
+### 40.3 Creating the store
+
+If no associated store exists, a read-write host MAY offer to create one. It
+MUST explain that the store contains derived, searchable data and obtain user
+permission for:
+
+1. the store path;
+2. the source root;
+3. the initial root policy; and
+4. whether the store should be registered for discovery.
+
+After permission, the host MUST perform these operations in order:
+
+```text
+create valid store at P.chutni
+→ add P as a root with the approved policy
+→ publish or register the store only after it is valid
+→ scan P
+→ create source records and reusable artifacts
+→ build disposable indexes
+```
+
+The host MUST NOT place the default store inside `P`; doing so risks indexing
+the store into itself. It MUST NOT overwrite an existing directory or invalid
+store at the candidate path. A valid store with an unsupported major version
+MUST be reported as present but unsupported, never replaced.
+
+Creation of the empty store and authorization to scan are distinct operations.
+A host MUST NOT scan other directories merely because it created a store.
+
+### 40.4 Opening and reusing a store
+
+Before reading or writing, the host MUST:
+
+1. validate the manifest format and major version;
+2. validate the required catalog and object locations;
+3. open read-only when write permission is absent;
+4. preserve unknown fields and namespaced extensions when rewriting; and
+5. report unsupported capabilities rather than silently rebuilding them.
+
+The host MUST inspect existing sources and artifacts before producing new ones.
+Current compatible artifacts SHOULD be reused. Missing artifact kinds or
+incompatible disposable representations MAY be generated without replacing
+portable artifacts that remain valid.
+
+### 40.5 Scanning and updating
+
+For every authorized root, a producer MUST apply the root policy and then:
+
+1. match files to existing sources using stable identity and locators;
+2. record current metadata and a BLAKE3 content hash;
+3. reuse current artifacts when the content hash is unchanged;
+4. mark prior content-derived artifacts stale when the hash changes;
+5. create new artifacts with exact source hashes and per-artifact provenance;
+6. mark unavailable sources accurately;
+7. commit catalog changes atomically; and
+8. rebuild disposable indexes only as needed.
+
+A host MUST NOT erase another producer's valid artifacts merely because it
+cannot use them. Multiple producers may coexist as described in §23.
+
+If a local or remote model creates an artifact, its producer record MUST name
+the model, revision, application, and runtime information required by §16.2.
+The derivation MUST identify the operation, recipe, parameters, and inputs.
+
+### 40.6 Retrieving memory for a model
+
+For each model turn that needs local memory, the host SHOULD:
+
+```text
+derive a bounded search request from the user's prompt
+→ search the selected store and authorized roots
+→ reject stale artifacts by default
+→ verify freshness for evidence that will be quoted or relied upon
+→ reopen the original source when exactness matters
+→ give the model bounded excerpts with source and provenance labels
+→ keep retrieved file text in the untrusted-data boundary
+```
+
+The model receives context selected from Chutni; it does not need to know the
+catalog schema. A tool-capable model MAY invoke the §20 operations through a
+gateway, but the gateway still enforces this section.
+
+For cloud-hosted models, §27 applies before any excerpt leaves the machine.
+
+### 40.7 Required failure behavior
+
+An Application Host MUST surface, rather than hide, these states:
+
+* no store exists and creation needs permission;
+* the candidate path exists but is not a Chutni store;
+* the store version is unsupported;
+* the store is readable but not writable;
+* more than one store is associated with the selected source;
+* a source or artifact is stale, missing, unreadable, or unsupported; and
+* a requested representation is incompatible.
+
+None of these states authorizes deleting, replacing, or rebuilding a store.
+
+### 40.8 Conformance claim
+
+An application claiming **Chutni Application Host 0.1** conformance MUST publish
+whether it is read-only or read-write, which search modes and artifact kinds it
+supports, and the result of conformance scenario 13. A read-write claim
+requires successful creation, handoff, update, and round-trip reuse with a
+second implementation.

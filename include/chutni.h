@@ -55,7 +55,9 @@ const char *chutni_last_error(const chutni_store *store);
 /* ---------------------------------------------------------------- discovery
  *
  * Any application may ask whether Chutni memory already exists on this
- * computer before deciding to create it. See SPEC.md §39.
+ * computer before deciding to create it. See SPEC.md §39. A host responding
+ * to a user-selected source directory follows the complete §40 lifecycle; the
+ * host, not the model, owns these calls and their permission boundary.
  */
 
 typedef struct {
@@ -81,6 +83,10 @@ chutni_status chutni_registry_remove(const char *store_path);
 
 /* ---------------------------------------------------------------- lifecycle */
 
+/* These are the storage primitives for a §40 Application Host. A host given an
+ * ordinary source directory P checks the adjacent P.chutni path, obtains user
+ * permission when creation is needed, calls chutni_create, then records P with
+ * chutni_root_add. The library does not infer permission from a path string. */
 chutni_status chutni_create(const char *path, const char *label,
                             chutni_store **out);
 chutni_status chutni_open(const char *path, int read_only, chutni_store **out);
@@ -292,6 +298,78 @@ chutni_status chutni_artifact_put(chutni_store *store,
                                   const chutni_artifact *artifact,
                                   char artifact_id[CHUTNI_ID_STRLEN]);
 
+/* ----------------------------------------------------------- representations
+ *
+ * Acceleration data derived from an artifact (§17): embeddings, token IDs,
+ * projected vision tokens. Representations are disposable by design (§6.3) —
+ * they mean nothing except to a consumer that understands the exact model and
+ * preprocessing that produced them, and MUST be regenerated rather than
+ * reinterpreted when that profile does not match.
+ *
+ * Chutni does not compute embeddings. A producer supplies the vector.
+ */
+
+typedef struct {
+    /* §17.2 requires generic visual embeddings and VLM-projected embeddings to
+     * use different kinds; §17.3 says the same of token IDs across tokenizers. */
+    const char *representation_kind;   /* e.g. "text_embedding" */
+    const char *model_id;
+    const char *model_revision;
+    int         dimensions;
+    const char *dtype;                 /* "f32" is the only value v0.1 stores */
+    const char *normalization;         /* "none" or "l2" */
+    const char *tokenizer_hash;        /* optional; see §17.3 */
+    const char *projector_hash;        /* optional; see §17.4 */
+} chutni_representation_profile;
+
+/* Store a vector against an artifact. The vector is serialized as a
+ * content-addressed object, so identical vectors share storage.
+ *
+ * The artifact's current payload is hashed into source_artifact_hash, which is
+ * what later makes it possible to tell that a representation describes text the
+ * artifact no longer holds. */
+chutni_status chutni_representation_put(chutni_store *store,
+                                        const char *artifact_id,
+                                        const chutni_representation_profile *profile,
+                                        const float *vector, size_t dimensions,
+                                        char representation_id[CHUTNI_ID_STRLEN]);
+
+/* Read a vector back. `accepted` declares the profile the caller can actually
+ * use; a representation that does not match it is refused with
+ * CHUTNI_ERR_DENIED rather than returned.
+ *
+ * This is deliberately not a convenience check the caller may skip. §22.6
+ * forbids a consumer from using incompatible embeddings, and comparing vectors
+ * from two different models produces confident nonsense rather than an error,
+ * so the API will not hand them over without being told what is usable.
+ *
+ * *vector is heap memory owned by the caller; free with chutni_free. */
+chutni_status chutni_representation_get(chutni_store *store,
+                                        const char *representation_id,
+                                        const chutni_representation_profile *accepted,
+                                        float **vector, size_t *dimensions);
+
+typedef struct {
+    char *representation_id;
+    char *artifact_id;
+    char *representation_kind;
+    char *model_id;
+    char *model_revision;
+    char *dtype;
+    char *normalization;
+    int   dimensions;
+    /* Nonzero when the artifact's payload still hashes to what this
+     * representation was built from. A zero here means regenerate, not
+     * reinterpret. */
+    int   compatible_with_artifact;
+} chutni_representation_info;
+
+chutni_status chutni_representations_list(chutni_store *store,
+                                          const char *artifact_id,
+                                          chutni_representation_info **out,
+                                          size_t *count);
+void chutni_representation_info_free(chutni_representation_info *reps, size_t count);
+
 /* ------------------------------------------------------------------- search */
 
 typedef struct {
@@ -326,6 +404,26 @@ typedef struct {
 chutni_status chutni_search(chutni_store *store,
                             const chutni_search_request *request,
                             chutni_search_result **out, size_t *count);
+
+typedef struct {
+    const float *vector;                /* the query embedding */
+    size_t       dimensions;
+    /* The profile the caller can use. Only representations matching it are
+     * compared; the rest are invisible rather than silently mixed in (§22.6). */
+    const chutni_representation_profile *profile;
+    const char *const *artifact_kinds;  /* NULL-terminated filter, may be NULL */
+    int limit;
+    int include_stale;
+} chutni_semantic_request;
+
+/* Brute-force cosine similarity over stored vectors. There is no approximate
+ * index in v0.1: every matching representation is loaded and scored, which is
+ * correct and linear. score_type is reported as "cosine_bruteforce", and §19.3
+ * forbids comparing it against another implementation's scores. */
+chutni_status chutni_search_semantic(chutni_store *store,
+                                     const chutni_semantic_request *request,
+                                     chutni_search_result **out, size_t *count);
+
 void chutni_search_result_free(chutni_search_result *results, size_t count);
 
 /* Rebuild everything under indexes/ from the catalog and object store (§8.4). */
