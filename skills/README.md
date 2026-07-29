@@ -17,9 +17,10 @@ runtime-agnostic — it describes a CLI and the rules for using it safely.
   YAML header, into the instructions field. The GPT needs a way to run
   `chutni`; without shell access it cannot reach a local store, and no
   instruction text changes that.
-- **MCP-based clients:** expose `chutni discover`, `chutni search`,
-  `chutni inspect`, and `chutni verify` as tools, and use the body as the tool
-  description. Note that MCP is a transport, not the memory format (§5.6).
+- **MCP-based clients:** launch the bundled `chutni-mcp` stdio server. Its
+  tools cover discovery, selected-folder activation, search, grouped source
+  context, rescans, and provenance-complete artifact submission. Note that MCP
+  is a transport, not the memory format (§5.6).
 - **Anything else:** the body is the contract. An application that follows the
   four rules in it is a conforming consumer under §22.
 

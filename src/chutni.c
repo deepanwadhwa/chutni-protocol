@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -36,6 +37,7 @@ struct chutni_store {
     cj      *manifest;      /* full tree, so unknown fields survive (§9.1) */
     int      read_only;
     int      have_index;    /* indexes/lexical.sqlite attached as "idx" */
+    int      writer_lock_fd;
     char     err[ERRBUF];
 };
 
@@ -72,6 +74,7 @@ const char *chutni_strerror(chutni_status status) {
     case CHUTNI_ERR_DENIED:    return "denied by policy";
     case CHUTNI_ERR_EXISTS:    return "already exists";
     case CHUTNI_ERR_READONLY:  return "store opened read-only";
+    case CHUTNI_ERR_BUSY:      return "store is busy";
     }
     return "unknown error";
 }
@@ -161,6 +164,28 @@ static int mkdir_p(const char *path) {
     }
     if (mkdir(tmp, 0700) != 0 && errno != EEXIST) return 0;
     return 1;
+}
+
+static chutni_status acquire_writer_lock(chutni_store *s) {
+    char path[PATH_MAX];
+    if (!path_join(path, sizeof path, s->path, "tmp/write.lock"))
+        return fail(s, CHUTNI_ERR_INVALID, "store path is too long");
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0)
+        return fail(s, CHUTNI_ERR_IO, "cannot open writer lock: %s",
+                    strerror(errno));
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int lock_errno = errno;
+        close(fd);
+        if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN)
+            return fail(s, CHUTNI_ERR_BUSY,
+                        "another application is writing this Chutni store");
+        return fail(s, CHUTNI_ERR_IO, "cannot acquire writer lock: %s",
+                    strerror(lock_errno));
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    s->writer_lock_fd = fd;
+    return CHUTNI_OK;
 }
 
 static int is_dir(const char *path) {
@@ -280,6 +305,16 @@ static int sql_exec(chutni_store *s, const char *sql) {
 static void bind_text_or_null(sqlite3_stmt *q, int idx, const char *v) {
     if (v) sqlite3_bind_text(q, idx, v, -1, SQLITE_TRANSIENT);
     else   sqlite3_bind_null(q, idx);
+}
+
+static int json_text_has_type(const char *text, cj_type type) {
+    if (!text) return 1;
+    const char *error = NULL;
+    cj *value = cj_parse(text, &error);
+    (void)error;
+    int valid = value && value->type == type;
+    cj_free(value);
+    return valid;
 }
 
 /* ------------------------------------------------------------------- schema */
@@ -670,6 +705,7 @@ chutni_status chutni_create(const char *path, const char *label, chutni_store **
 
     chutni_store *s = calloc(1, sizeof *s);
     if (!s) return CHUTNI_ERR_NOMEM;
+    s->writer_lock_fd = -1;
     snprintf(s->path, sizeof s->path, "%s", abs);
 
     if (!uuid7(s->store_id)) { free(s); return fail(NULL, CHUTNI_ERR_IO, "no entropy source"); }
@@ -702,7 +738,9 @@ chutni_status chutni_create(const char *path, const char *label, chutni_store **
     cj_set(producer, "version", cj_str(CHUTNI_LIB_VERSION));
     cj_set(s->manifest, "created_by", producer);
 
-    chutni_status st = open_catalog(s, 1);
+    chutni_status st = acquire_writer_lock(s);
+    if (st != CHUTNI_OK) { chutni_close(s); return st; }
+    st = open_catalog(s, 1);
     if (st != CHUTNI_OK) { chutni_close(s); return st; }
     if (!manifest_save(s)) { chutni_close(s); return fail(NULL, CHUTNI_ERR_IO, "cannot write manifest"); }
 
@@ -756,13 +794,16 @@ chutni_status chutni_open(const char *path, int read_only, chutni_store **out) {
 
     chutni_store *s = calloc(1, sizeof *s);
     if (!s) { cj_free(m); return CHUTNI_ERR_NOMEM; }
+    s->writer_lock_fd = -1;
     snprintf(s->path, sizeof s->path, "%s", abs);
     s->manifest = m;
     s->read_only = read_only ? 1 : 0;
     const char *sid = cj_get_str(m, "store_id");
     snprintf(s->store_id, sizeof s->store_id, "%s", sid ? sid : "");
 
-    chutni_status st = open_catalog(s, 0);
+    chutni_status st = CHUTNI_OK;
+    if (!s->read_only) st = acquire_writer_lock(s);
+    if (st == CHUTNI_OK) st = open_catalog(s, 0);
     if (st != CHUTNI_OK) { char e[ERRBUF]; snprintf(e, sizeof e, "%s", s->err); chutni_close(s); return fail(NULL, st, "%s", e); }
 
     *out = s;
@@ -772,6 +813,10 @@ chutni_status chutni_open(const char *path, int read_only, chutni_store **out) {
 void chutni_close(chutni_store *s) {
     if (!s) return;
     if (s->db) sqlite3_close(s->db);
+    if (s->writer_lock_fd >= 0) {
+        flock(s->writer_lock_fd, LOCK_UN);
+        close(s->writer_lock_fd);
+    }
     cj_free(s->manifest);
     free(s);
 }
@@ -1010,8 +1055,14 @@ chutni_status chutni_list_artifacts(chutni_store *s, const char *source_id,
     sqlite3_stmt *q = NULL;
     if (sqlite3_prepare_v2(s->db,
             "SELECT a.artifact_id, a.artifact_kind, a.artifact_origin, a.media_type, a.status,"
-            "       a.object_hash, a.inline_text, a.selector_json, a.source_content_hash,"
-            "       a.created_at, p.name, p.producer_kind, p.model_id, p.model_revision, d.operation"
+            "       a.object_hash, a.inline_text, a.selector_json, a.language,"
+            "       a.source_content_hash, a.created_at, a.metadata_json,"
+            "       a.supersedes_artifact_id,"
+            "       p.producer_id, p.name, p.producer_kind, p.version,"
+            "       p.model_id, p.model_revision, p.weights_hash, p.quantization,"
+            "       p.runtime, p.app_name, p.app_version, p.details_json,"
+            "       d.derivation_id, d.operation, d.recipe_hash, d.parameters_json,"
+            "       d.input_refs_json, d.created_at"
             " FROM artifacts a"
             " LEFT JOIN derivations d ON d.derivation_id=a.derivation_id"
             " LEFT JOIN producers p ON p.producer_id=d.producer_id"
@@ -1036,13 +1087,29 @@ chutni_status chutni_list_artifacts(chutni_store *s, const char *source_id,
         vec[n].object_hash         = dup_col(q, 5);
         vec[n].inline_text         = dup_col(q, 6);
         vec[n].selector_json       = dup_col(q, 7);
-        vec[n].source_content_hash = dup_col(q, 8);
-        vec[n].created_at          = dup_col(q, 9);
-        vec[n].producer_name       = dup_col(q, 10);
-        vec[n].producer_kind       = dup_col(q, 11);
-        vec[n].model_id            = dup_col(q, 12);
-        vec[n].model_revision      = dup_col(q, 13);
-        vec[n].operation           = dup_col(q, 14);
+        vec[n].language            = dup_col(q, 8);
+        vec[n].source_content_hash = dup_col(q, 9);
+        vec[n].created_at          = dup_col(q, 10);
+        vec[n].metadata_json       = dup_col(q, 11);
+        vec[n].supersedes_artifact_id = dup_col(q, 12);
+        vec[n].producer_id         = dup_col(q, 13);
+        vec[n].producer_name       = dup_col(q, 14);
+        vec[n].producer_kind       = dup_col(q, 15);
+        vec[n].producer_version    = dup_col(q, 16);
+        vec[n].model_id            = dup_col(q, 17);
+        vec[n].model_revision      = dup_col(q, 18);
+        vec[n].weights_hash        = dup_col(q, 19);
+        vec[n].quantization        = dup_col(q, 20);
+        vec[n].runtime             = dup_col(q, 21);
+        vec[n].app_name            = dup_col(q, 22);
+        vec[n].app_version         = dup_col(q, 23);
+        vec[n].producer_details_json = dup_col(q, 24);
+        vec[n].derivation_id       = dup_col(q, 25);
+        vec[n].operation           = dup_col(q, 26);
+        vec[n].recipe_hash         = dup_col(q, 27);
+        vec[n].parameters_json     = dup_col(q, 28);
+        vec[n].input_refs_json     = dup_col(q, 29);
+        vec[n].derivation_created_at = dup_col(q, 30);
         n++;
     }
     sqlite3_finalize(q);
@@ -1062,13 +1129,29 @@ void chutni_artifact_info_free(chutni_artifact_info *a, size_t count) {
         free(a[i].object_hash);
         free(a[i].inline_text);
         free(a[i].selector_json);
+        free(a[i].language);
         free(a[i].source_content_hash);
         free(a[i].created_at);
+        free(a[i].metadata_json);
+        free(a[i].supersedes_artifact_id);
+        free(a[i].producer_id);
         free(a[i].producer_name);
         free(a[i].producer_kind);
+        free(a[i].producer_version);
         free(a[i].model_id);
         free(a[i].model_revision);
+        free(a[i].weights_hash);
+        free(a[i].quantization);
+        free(a[i].runtime);
+        free(a[i].app_name);
+        free(a[i].app_version);
+        free(a[i].producer_details_json);
+        free(a[i].derivation_id);
         free(a[i].operation);
+        free(a[i].recipe_hash);
+        free(a[i].parameters_json);
+        free(a[i].input_refs_json);
+        free(a[i].derivation_created_at);
     }
     free(a);
 }
@@ -1179,6 +1262,13 @@ chutni_status chutni_producer_put(chutni_store *s, const chutni_producer *p,
     int known = 0;
     for (const char **k = kinds; *k; k++) if (!strcmp(*k, p->producer_kind)) { known = 1; break; }
     if (!known) return fail(s, CHUTNI_ERR_INVALID, "producer_kind \"%s\" is not one of §16.1", p->producer_kind);
+    if (p->details_json && !json_text_has_type(p->details_json, CJ_OBJ))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "producer details_json must be a JSON object");
+    if (!strcmp(p->producer_kind, "model") &&
+        (!p->model_id || !p->app_name || !p->app_version))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "model producers require model_id, app_name, and app_version (§16.2)");
 
     sqlite3_stmt *q = NULL;
     if (sqlite3_prepare_v2(s->db,
@@ -1233,6 +1323,12 @@ chutni_status chutni_derivation_put(chutni_store *s, const char *producer_id,
                                     char derivation_id[CHUTNI_ID_STRLEN]) {
     if (!s || !producer_id || !operation || !derivation_id) return CHUTNI_ERR_INVALID;
     if (s->read_only) return fail(s, CHUTNI_ERR_READONLY, "store is read-only");
+    if (parameters_json && !json_text_has_type(parameters_json, CJ_OBJ))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "derivation parameters_json must be a JSON object");
+    if (input_refs_json && !json_text_has_type(input_refs_json, CJ_ARR))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "derivation input_refs_json must be a JSON array");
     if (!uuid7(derivation_id)) return fail(s, CHUTNI_ERR_IO, "no entropy");
     char now[32];
     iso_now(now);
@@ -1674,26 +1770,164 @@ static void fts_insert(chutni_store *s, const char *artifact_id, const char *sou
     sqlite3_finalize(q);
 }
 
+static chutni_status validate_artifact(chutni_store *s,
+                                       const chutni_artifact *a) {
+    if (!a->source_id || !a->artifact_kind || !a->artifact_origin)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "source_id, artifact_kind, and artifact_origin are required");
+    if (!a->object_hash && !a->inline_text)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "artifact needs object_hash or inline_text (§10)");
+    if (a->object_hash && a->inline_text)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "artifact must use object_hash or inline_text, not both");
+
+    static const char *origins[] = {
+        "direct", "deterministic_transform", "model_generated", "human", NULL
+    };
+    int known = 0;
+    for (const char **origin = origins; *origin; origin++)
+        if (!strcmp(*origin, a->artifact_origin)) {
+            known = 1;
+            break;
+        }
+    if (!known)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "artifact_origin \"%s\" is not one of §15.1",
+                    a->artifact_origin);
+
+    int machine_derived =
+        !strcmp(a->artifact_origin, "deterministic_transform") ||
+        !strcmp(a->artifact_origin, "model_generated");
+    if (machine_derived && !a->derivation_id)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "%s artifacts require processing provenance (§16.3)",
+                    a->artifact_origin);
+    if (machine_derived && !a->source_content_hash)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "%s artifacts require source_content_hash (§13.3)",
+                    a->artifact_origin);
+
+    if (a->selector_json &&
+        !json_text_has_type(a->selector_json, CJ_OBJ))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "selector_json must be a JSON object");
+    if (a->metadata_json &&
+        !json_text_has_type(a->metadata_json, CJ_OBJ))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "artifact metadata_json must be a JSON object");
+    if (a->source_content_hash && !hash_is_valid(a->source_content_hash))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "artifact source_content_hash is malformed");
+    if (a->object_hash && !hash_is_valid(a->object_hash))
+        return fail(s, CHUTNI_ERR_INVALID, "artifact object_hash is malformed");
+
+    sqlite3_stmt *query = NULL;
+    if (sqlite3_prepare_v2(
+            s->db,
+            "SELECT state, content_hash FROM sources WHERE source_id=?1",
+            -1, &query, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    sqlite3_bind_text(query, 1, a->source_id, -1, SQLITE_TRANSIENT);
+    int row = sqlite3_step(query);
+    char source_state[32] = "";
+    char source_hash[CHUTNI_HASH_STRLEN] = "";
+    if (row == SQLITE_ROW) {
+        const unsigned char *state = sqlite3_column_text(query, 0);
+        const unsigned char *hash = sqlite3_column_text(query, 1);
+        if (state) snprintf(source_state, sizeof source_state, "%s",
+                            (const char *)state);
+        if (hash) snprintf(source_hash, sizeof source_hash, "%s",
+                           (const char *)hash);
+    }
+    sqlite3_finalize(query);
+    if (row != SQLITE_ROW)
+        return fail(s, CHUTNI_ERR_NOTFOUND,
+                    "artifact source_id is not in this store");
+    if (a->source_content_hash &&
+        (!source_hash[0] || strcmp(a->source_content_hash, source_hash)))
+        return fail(s, CHUTNI_ERR_DENIED,
+                    "artifact describes a different source version");
+    if (a->source_content_hash && strcmp(source_state, "present"))
+        return fail(s, CHUTNI_ERR_DENIED,
+                    "artifact source is not currently present");
+
+    if (a->derivation_id) {
+        if (sqlite3_prepare_v2(
+                s->db,
+                "SELECT 1 FROM derivations WHERE derivation_id=?1",
+                -1, &query, NULL) != SQLITE_OK)
+            return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+        sqlite3_bind_text(query, 1, a->derivation_id, -1,
+                          SQLITE_TRANSIENT);
+        row = sqlite3_step(query);
+        sqlite3_finalize(query);
+        if (row != SQLITE_ROW)
+            return fail(s, CHUTNI_ERR_NOTFOUND,
+                        "artifact derivation_id is not in this store");
+    }
+    if (!strcmp(a->artifact_origin, "model_generated")) {
+        if (sqlite3_prepare_v2(
+                s->db,
+                "SELECT p.model_id, p.app_name, p.app_version"
+                " FROM derivations d JOIN producers p"
+                " ON p.producer_id=d.producer_id"
+                " WHERE d.derivation_id=?1",
+                -1, &query, NULL) != SQLITE_OK)
+            return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+        sqlite3_bind_text(query, 1, a->derivation_id, -1,
+                          SQLITE_TRANSIENT);
+        row = sqlite3_step(query);
+        int complete =
+            row == SQLITE_ROW &&
+            sqlite3_column_text(query, 0) &&
+            sqlite3_column_text(query, 1) &&
+            sqlite3_column_text(query, 2);
+        sqlite3_finalize(query);
+        if (!complete)
+            return fail(s, CHUTNI_ERR_INVALID,
+                        "model-generated artifacts require model and host application identity (§16.2)");
+    }
+    if (a->object_hash) {
+        if (sqlite3_prepare_v2(
+                s->db, "SELECT 1 FROM objects WHERE object_hash=?1",
+                -1, &query, NULL) != SQLITE_OK)
+            return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+        sqlite3_bind_text(query, 1, a->object_hash, -1, SQLITE_TRANSIENT);
+        row = sqlite3_step(query);
+        sqlite3_finalize(query);
+        if (row != SQLITE_ROW)
+            return fail(s, CHUTNI_ERR_NOTFOUND,
+                        "artifact object_hash is not in this store");
+    }
+    if (a->supersedes_artifact_id) {
+        if (sqlite3_prepare_v2(
+                s->db,
+                "SELECT source_id FROM artifacts WHERE artifact_id=?1",
+                -1, &query, NULL) != SQLITE_OK)
+            return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+        sqlite3_bind_text(query, 1, a->supersedes_artifact_id, -1,
+                          SQLITE_TRANSIENT);
+        row = sqlite3_step(query);
+        int same_source =
+            row == SQLITE_ROW &&
+            sqlite3_column_text(query, 0) &&
+            !strcmp((const char *)sqlite3_column_text(query, 0),
+                    a->source_id);
+        sqlite3_finalize(query);
+        if (!same_source)
+            return fail(s, CHUTNI_ERR_INVALID,
+                        "an artifact may only supersede one from the same source");
+    }
+    return CHUTNI_OK;
+}
+
 chutni_status chutni_artifact_put(chutni_store *s, const chutni_artifact *a,
                                   char artifact_id[CHUTNI_ID_STRLEN]) {
     if (!s || !a || !artifact_id) return CHUTNI_ERR_INVALID;
     if (s->read_only) return fail(s, CHUTNI_ERR_READONLY, "store is read-only");
-    if (!a->source_id || !a->artifact_kind || !a->artifact_origin)
-        return fail(s, CHUTNI_ERR_INVALID, "source_id, artifact_kind, artifact_origin are required");
-    if (!a->object_hash && !a->inline_text)
-        return fail(s, CHUTNI_ERR_INVALID, "artifact needs object_hash or inline_text (§10)");
-
-    static const char *origins[] = { "direct","deterministic_transform","model_generated","human",NULL };
-    int known = 0;
-    for (const char **o = origins; *o; o++) if (!strcmp(*o, a->artifact_origin)) { known = 1; break; }
-    if (!known)
-        return fail(s, CHUTNI_ERR_INVALID, "artifact_origin \"%s\" is not one of §15.1", a->artifact_origin);
-
-    /* §16.4 is the point of the format: a model-generated artifact without a
-       derivation cannot be traced to the model that made it. */
-    if (!strcmp(a->artifact_origin, "model_generated") && !a->derivation_id)
-        return fail(s, CHUTNI_ERR_INVALID,
-                    "model_generated artifacts require a derivation_id (§16.4)");
+    chutni_status validation = validate_artifact(s, a);
+    if (validation != CHUTNI_OK) return validation;
 
     if (!uuid7(artifact_id)) return fail(s, CHUTNI_ERR_IO, "no entropy");
     char now[32];
@@ -1757,6 +1991,51 @@ chutni_status chutni_artifact_put(chutni_store *s, const chutni_artifact *a,
     fts_insert(s, artifact_id, a->source_id, a->artifact_kind, text);
     free(loaded);
     return CHUTNI_OK;
+}
+
+chutni_status chutni_artifacts_put(
+    chutni_store *s,
+    const chutni_producer *producer,
+    const char *operation,
+    const char *recipe_hash,
+    const char *parameters_json,
+    const char *input_refs_json,
+    const chutni_artifact *artifacts,
+    size_t artifact_count,
+    char producer_id[CHUTNI_ID_STRLEN],
+    char derivation_id[CHUTNI_ID_STRLEN],
+    char (*artifact_ids)[CHUTNI_ID_STRLEN]) {
+    if (!s || !producer || !operation || !*operation || !artifacts ||
+        !artifact_count || !producer_id || !derivation_id || !artifact_ids)
+        return CHUTNI_ERR_INVALID;
+    if (s->read_only)
+        return fail(s, CHUTNI_ERR_READONLY, "store is read-only");
+    for (size_t i = 0; i < artifact_count; i++)
+        if (!artifacts[i].source_content_hash)
+            return fail(s, CHUTNI_ERR_INVALID,
+                        "generic submissions require source_content_hash for every artifact");
+
+    if (!sql_exec(s, "BEGIN IMMEDIATE")) return CHUTNI_ERR_DB;
+    chutni_status status =
+        chutni_producer_put(s, producer, producer_id);
+    if (status == CHUTNI_OK)
+        status = chutni_derivation_put(
+            s, producer_id, operation, recipe_hash, parameters_json,
+            input_refs_json, derivation_id);
+    for (size_t i = 0; status == CHUTNI_OK && i < artifact_count; i++) {
+        chutni_artifact item = artifacts[i];
+        item.derivation_id = derivation_id;
+        status = chutni_artifact_put(s, &item, artifact_ids[i]);
+    }
+    if (status == CHUTNI_OK && sql_exec(s, "COMMIT"))
+        return CHUTNI_OK;
+    if (status == CHUTNI_OK) status = CHUTNI_ERR_DB;
+
+    char detail[ERRBUF];
+    snprintf(detail, sizeof detail, "%s", chutni_last_error(s));
+    sql_exec(s, "ROLLBACK");
+    return fail(s, status, "%s",
+                detail[0] ? detail : chutni_strerror(status));
 }
 
 /* ----------------------------------------------------------- representations */

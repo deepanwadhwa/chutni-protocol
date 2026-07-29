@@ -686,6 +686,22 @@ A recipe hash allows consumers to distinguish artifacts produced by the same mod
 
 The full prompt MAY be stored, but Chutni does not require it because prompts may contain private or proprietary data.
 
+### 16.4 Integrity validation is not semantic verification
+
+Chutni validates the integrity of a submitted artifact:
+
+* required fields and JSON shapes;
+* references to an existing source, producer, derivation, and object;
+* an exact `source_content_hash` matching the source version in the catalog;
+* immutable payload hashes;
+* allowed artifact origins and safe selectors; and
+* the presence of processing provenance for machine-derived artifacts.
+
+Chutni MUST NOT claim that submitted content is true, accurate, complete, or a
+faithful interpretation of the source. A caption, OCR result, transcript,
+summary, keyword list, or other model output is a producer-attributed claim.
+Its presence in a valid store certifies provenance and integrity only.
+
 ## 17. Representations
 
 A representation is acceleration data derived from an artifact.
@@ -851,7 +867,9 @@ get_artifact(artifact_id)
 read_object(object_hash)
 check_freshness(source_id | artifact_id)
 list_artifacts(source_id)
+source_context(source_id)
 add_or_update_source(locator)
+put_artifacts(producer, derivation, artifacts[])
 mark_source_missing(source_id)
 forget_source(source_id, mode)
 rebuild_indexes()
@@ -867,6 +885,7 @@ get_source(source_id)
 get_artifact(artifact_id)
 read_object(object_hash)
 check_freshness(...)
+source_context(source_id)
 ```
 
 The access layer may be implemented as a library or service. The wire transport is not fixed in v0.1.
@@ -961,6 +980,12 @@ The protocol cannot guarantee physical erasure on copy-on-write file systems, SS
 ## 25. Multimodal ingestion guidance
 
 The protocol does not require one ingestion pipeline, but recommends staged processing.
+
+The host application or its parser/model pipeline performs these operations.
+Chutni defines how their outputs, selectors, source-version bindings, and
+provenance are recorded and exchanged. A Chutni implementation MAY ship
+convenience extractors, but PDF parsing, OCR, image understanding, spreadsheet
+reading, and speech recognition are not protocol responsibilities.
 
 ### 25.1 Text documents
 
@@ -1063,7 +1088,10 @@ A gateway SHOULD support:
 7. Write-capable clients SHOULD be separately authorized from read-only clients.
 8. Object paths MUST be derived from validated hashes, not user-controlled relative paths.
 9. SQLite writes SHOULD use transactions and crash-safe settings.
-10. Producers SHOULD record processing errors without embedding secrets in logs.
+10. A local store MUST coordinate writers across processes. An implementation
+    MAY serialize write handles and return a retryable busy error rather than
+    attempting to merge simultaneous local mutations.
+11. Producers SHOULD record processing errors without embedding secrets in logs.
 
 ## 29. Extensions
 
@@ -1134,8 +1162,9 @@ A host that retrieves memory for a model MUST satisfy Search Provider
 requirements.
 
 The host application, not the language model, owns the protocol boundary. Model
-output becomes part of a Chutni store only when the host records it as a valid
-artifact with the required producer and derivation provenance.
+output becomes part of a Chutni store only when the host records it as a
+structurally valid artifact with the required producer and derivation
+provenance. This does not certify the output as semantically true (§16.4).
 
 ### 30.6 Chutni Full Implementation
 
@@ -1153,7 +1182,11 @@ The Chutni project SHOULD publish a test suite containing:
 5. Multiple summaries from different models.
 6. Shared content-addressed objects.
 7. Deleted and missing sources.
-8. Text, image, spreadsheet, and audio examples.
+8. Rich-artifact interoperability: one host submits selected PDF/OCR/image,
+   spreadsheet, or audio-derived artifacts, another host contributes a
+   separate interpretation, and a third can read both with selectors,
+   timestamps, source-version binding, and complete provenance. The test does
+   not require Chutni itself to parse those file formats.
 9. Invalid object hashes.
 10. Path-encoding edge cases.
 11. Prompt-injection text that consumers must treat as data.
@@ -1454,16 +1487,18 @@ same lifecycle. The transport and model are irrelevant to the store format.
 
 ### 40.1 Responsibility boundary
 
-The **host application** MUST perform store discovery, validation, creation,
-catalog updates, freshness checks, permission enforcement, and provenance
-recording. It MAY do so through a conforming library, a local service, a
-gateway, or its own implementation of this specification.
+The **host application** MUST perform store discovery, structural validation,
+creation, catalog updates, freshness checks, permission enforcement, and
+provenance recording. It MAY do so through a conforming library, a local
+service, a gateway, or its own implementation of this specification.
 
 The **language model** MAY choose search terms, rank candidates, or produce
 derived text or vectors. It MUST NOT be relied upon to construct SQL, invent
 catalog rows, decide permissions, or declare its own output current. Before
-model output is committed, the host MUST validate it and create the producer,
-derivation, artifact, and representation records required by §§15–17.
+model output is committed, the host MUST bind it to the exact source version
+and create the producer, derivation, artifact, and representation records
+required by §§15–17. Structural validity and provenance do not certify the
+model's claim as correct.
 
 An unmodified application does not gain Chutni support merely because a store
 exists. The application or an authorized adapter must implement this lifecycle.

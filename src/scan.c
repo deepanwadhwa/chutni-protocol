@@ -68,10 +68,6 @@ static void scan_file(scan_context *sc, const char *path,
         return;
     }
     sc->result->sources_indexed++;
-    if (!changed) {
-        sc->result->unchanged++;
-        return;
-    }
 
     char content_hash[CHUTNI_HASH_STRLEN];
     if (chutni_hash_file(path, content_hash) != CHUTNI_OK) {
@@ -79,30 +75,74 @@ static void scan_file(scan_context *sc, const char *path,
         return;
     }
 
-    chutni_artifact artifact;
-    memset(&artifact, 0, sizeof artifact);
-    artifact.source_id = source_id;
-    artifact.source_content_hash = content_hash;
+    int need_metadata = 1;
+    int need_text = looks_texty(path) && st->st_size > 0;
+    if (!changed) {
+        sc->result->unchanged++;
+        chutni_artifact_info *existing = NULL;
+        size_t existing_count = 0;
+        if (chutni_list_artifacts(sc->store, source_id, &existing,
+                                  &existing_count) == CHUTNI_OK) {
+            for (size_t i = 0; i < existing_count; i++) {
+                if (!existing[i].status ||
+                    strcmp(existing[i].status, "active") ||
+                    !existing[i].source_content_hash ||
+                    strcmp(existing[i].source_content_hash, content_hash))
+                    continue;
+                if (existing[i].artifact_kind &&
+                    !strcmp(existing[i].artifact_kind, "file_metadata"))
+                    need_metadata = 0;
+                if (existing[i].artifact_kind &&
+                    !strcmp(existing[i].artifact_kind, "extracted_text"))
+                    need_text = 0;
+            }
+        }
+        chutni_artifact_info_free(existing, existing_count);
+        if (!need_metadata && !need_text) return;
+    }
 
     char artifact_id[CHUTNI_ID_STRLEN];
+    if (need_metadata) {
+        char metadata[256];
+        snprintf(metadata, sizeof metadata, "{\"size_bytes\":%lld}",
+                 (long long)st->st_size);
+        chutni_artifact artifact;
+        memset(&artifact, 0, sizeof artifact);
+        artifact.source_id = source_id;
+        artifact.source_content_hash = content_hash;
+        artifact.artifact_kind = "file_metadata";
+        artifact.artifact_origin = "direct";
+        artifact.media_type = "application/json";
+        artifact.inline_text = metadata;
+        artifact.derivation_id = sc->derivation_meta;
+        if (chutni_artifact_put(sc->store, &artifact, artifact_id) == CHUTNI_OK)
+            sc->result->metadata_artifacts++;
+        else
+            sc->result->errors++;
+    }
+
+    if (!need_text) return;
+
     char *text = NULL;
-    if (looks_texty(path) && st->st_size > 0) {
-        FILE *file = fopen(path, "rb");
-        if (file) {
-            text = malloc((size_t)st->st_size + 1);
-            if (text) {
-                size_t got = fread(text, 1, (size_t)st->st_size, file);
-                text[got] = 0;
-                if (memchr(text, 0, got)) {
-                    free(text);
-                    text = NULL;
-                }
+    FILE *file = fopen(path, "rb");
+    if (file) {
+        text = malloc((size_t)st->st_size + 1);
+        if (text) {
+            size_t got = fread(text, 1, (size_t)st->st_size, file);
+            text[got] = 0;
+            if (memchr(text, 0, got)) {
+                free(text);
+                text = NULL;
             }
-            fclose(file);
         }
+        fclose(file);
     }
 
     if (text) {
+        chutni_artifact artifact;
+        memset(&artifact, 0, sizeof artifact);
+        artifact.source_id = source_id;
+        artifact.source_content_hash = content_hash;
         artifact.artifact_kind = "extracted_text";
         artifact.artifact_origin = "deterministic_transform";
         artifact.media_type = "text/plain; charset=utf-8";
@@ -113,19 +153,6 @@ static void scan_file(scan_context *sc, const char *path,
         else
             sc->result->errors++;
         free(text);
-    } else {
-        char metadata[256];
-        snprintf(metadata, sizeof metadata, "{\"size_bytes\":%lld}",
-                 (long long)st->st_size);
-        artifact.artifact_kind = "file_metadata";
-        artifact.artifact_origin = "direct";
-        artifact.media_type = "application/json";
-        artifact.inline_text = metadata;
-        artifact.derivation_id = sc->derivation_meta;
-        if (chutni_artifact_put(sc->store, &artifact, artifact_id) == CHUTNI_OK)
-            sc->result->metadata_artifacts++;
-        else
-            sc->result->errors++;
     }
 }
 

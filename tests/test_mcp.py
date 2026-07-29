@@ -122,12 +122,22 @@ def main():
             "chutni_folder_status",
             "chutni_folder_activate",
             "chutni_discover",
+            "chutni_capabilities",
             "chutni_store_info",
             "chutni_scan",
             "chutni_search",
+            "chutni_source_context",
+            "chutni_put_artifacts",
             "chutni_put_model_artifact",
         }
         assert names == expected
+
+        capabilities, failed = session.tool("chutni_capabilities", {})
+        assert not failed
+        assert capabilities["semantic_validation"] == "not_performed"
+        assert capabilities["writer_policy"] == "single_writer_many_readers"
+        assert capabilities["reference_scanner"]["file_metadata_for_every_file"]
+        assert not capabilities["reference_scanner"]["ocr"]
 
         status, failed = session.tool(
             "chutni_folder_status", {"path": str(source)}
@@ -159,9 +169,26 @@ def main():
         assert activated["created"] is True
         assert activated["store_path"] == str(store)
         assert activated["scan"]["text_artifacts"] == 1
-        assert activated["counts"]["artifacts_active"] == 1
+        assert activated["scan"]["metadata_artifacts"] == 1
+        assert activated["counts"]["artifacts_active"] == 2
         assert (store / "manifest.json").is_file()
         assert (store / "catalog.sqlite").is_file()
+
+        initial_context, failed = session.tool(
+            "chutni_source_context",
+            {"store_path": str(store), "source_path": str(note)},
+        )
+        assert not failed, initial_context
+        assert initial_context["artifact_count"] == 2
+        assert {
+            artifact["artifact_kind"]
+            for artifact in initial_context["artifacts"]
+        } == {"file_metadata", "extracted_text"}
+        assert all(
+            artifact["provenance"]["derivation"]["operation"]
+            in {"record_file_metadata", "extract_text"}
+            for artifact in initial_context["artifacts"]
+        )
 
         found, failed = session.tool(
             "chutni_search",
@@ -193,7 +220,7 @@ def main():
         assert not failed
         assert info["counts"]["roots"] == 1
         assert info["counts"]["sources"] == 1
-        assert info["counts"]["artifacts_active"] == 1
+        assert info["counts"]["artifacts_active"] == 2
 
         discovered, failed = session.tool("chutni_discover", {})
         assert not failed
@@ -228,6 +255,178 @@ def main():
         )
         assert not failed and current["count"] == 1
 
+        current_context, failed = session.tool(
+            "chutni_source_context",
+            {"store_path": str(store), "source_path": str(note)},
+        )
+        assert not failed, current_context
+        current_hash = current_context["source"]["content_hash"]
+
+        refused, failed = session.tool(
+            "chutni_put_artifacts",
+            {
+                "store_path": str(store),
+                "source_path": str(note),
+                "source_content_hash": current_hash,
+                "producer": {
+                    "producer_kind": "parser",
+                    "name": "Host A OCR",
+                    "version": "3",
+                    "app_name": "host-a",
+                    "app_version": "1",
+                },
+                "operation": "ocr",
+                "artifacts": [
+                    {
+                        "artifact_kind": "ocr_text",
+                        "artifact_origin": "deterministic_transform",
+                        "text": "OCR page one mentions chromatophores.",
+                        "selector": {"type": "pages", "start": 1, "end": 1},
+                    }
+                ],
+                "confirmed": False,
+            },
+        )
+        assert failed and refused["error"] == "confirmation_required"
+
+        parsed, failed = session.tool(
+            "chutni_put_artifacts",
+            {
+                "store_path": str(store),
+                "source_path": str(note),
+                "source_content_hash": current_hash,
+                "producer": {
+                    "producer_kind": "parser",
+                    "name": "Host A OCR",
+                    "version": "3",
+                    "app_name": "host-a",
+                    "app_version": "1",
+                },
+                "operation": "ocr",
+                "recipe_hash": "recipe:ocr-v3",
+                "parameters": {"language": "en"},
+                "artifacts": [
+                    {
+                        "artifact_kind": "ocr_text",
+                        "artifact_origin": "deterministic_transform",
+                        "text": "OCR page one mentions chromatophores.",
+                        "selector": {"type": "pages", "start": 1, "end": 1},
+                    },
+                    {
+                        "artifact_kind": "ocr_text",
+                        "artifact_origin": "deterministic_transform",
+                        "text": "OCR page two mentions adaptive color.",
+                        "selector": {"type": "pages", "start": 2, "end": 2},
+                    },
+                ],
+                "confirmed": True,
+            },
+        )
+        assert not failed, parsed
+        assert len(parsed["artifacts"]) == 2
+        assert parsed["semantic_validation"] == "not_performed"
+
+        interpreted, failed = session.tool(
+            "chutni_put_artifacts",
+            {
+                "store_path": str(store),
+                "source_id": current_context["source"]["source_id"],
+                "source_content_hash": current_hash,
+                "producer": {
+                    "producer_kind": "model",
+                    "name": "Host B local model",
+                    "model_id": "example/host-b-model",
+                    "model_revision": "r2",
+                    "runtime": "host-b-runtime",
+                    "app_name": "host-b",
+                    "app_version": "2",
+                },
+                "operation": "summarize",
+                "recipe_hash": "recipe:summary-r2",
+                "inputs": [
+                    {
+                        "artifact_id": parsed["artifacts"][0]["artifact_id"],
+                        "role": "ocr_text",
+                    }
+                ],
+                "artifacts": [
+                    {
+                        "artifact_kind": "summary_short",
+                        "artifact_origin": "model_generated",
+                        "text": "This file is about a dog.",
+                    }
+                ],
+                "confirmed": True,
+            },
+        )
+        assert not failed, interpreted
+
+        wrong_version, failed = session.tool(
+            "chutni_put_artifacts",
+            {
+                "store_path": str(store),
+                "source_path": str(note),
+                "source_content_hash": "blake3:" + ("0" * 64),
+                "producer": {
+                    "producer_kind": "parser",
+                    "name": "Host C parser",
+                },
+                "operation": "extract",
+                "artifacts": [
+                    {
+                        "artifact_kind": "page_text",
+                        "artifact_origin": "deterministic_transform",
+                        "text": "must not be stored",
+                    }
+                ],
+                "confirmed": True,
+            },
+        )
+        assert failed and wrong_version["error"] == "source_version_mismatch"
+
+        incomplete_model, failed = session.tool(
+            "chutni_put_artifacts",
+            {
+                "store_path": str(store),
+                "source_path": str(note),
+                "source_content_hash": current_hash,
+                "producer": {
+                    "producer_kind": "parser",
+                    "name": "Unidentified model pipeline",
+                },
+                "operation": "summarize",
+                "artifacts": [
+                    {
+                        "artifact_kind": "summary_short",
+                        "artifact_origin": "model_generated",
+                        "text": "must not be stored without model identity",
+                    }
+                ],
+                "confirmed": True,
+            },
+        )
+        assert failed and incomplete_model["ok"] is False
+
+        combined, failed = session.tool(
+            "chutni_source_context",
+            {
+                "store_path": str(store),
+                "source_id": current_context["source"]["source_id"],
+            },
+        )
+        assert not failed, combined
+        by_kind = {}
+        for artifact in combined["artifacts"]:
+            by_kind.setdefault(artifact["artifact_kind"], []).append(artifact)
+        assert len(by_kind["ocr_text"]) == 2
+        assert any(
+            artifact["content"] == "This file is about a dog."
+            and artifact["provenance"]["producer"]["app_name"] == "host-b"
+            and artifact["provenance"]["derivation"]["operation"] == "summarize"
+            and artifact["semantic_validation"] == "not_performed"
+            for artifact in by_kind["summary_short"]
+        )
+
         stored, failed = session.tool(
             "chutni_put_model_artifact",
             {
@@ -248,6 +447,7 @@ def main():
         )
         assert not failed, stored
         assert stored["artifact_id"]
+        assert stored["semantic_validation"] == "not_performed"
 
         summary, failed = session.tool(
             "chutni_search",
@@ -264,7 +464,7 @@ def main():
         assert one_shot_status["action"] == "open_store"
         assert one_shot_status["store_path"] == str(store)
 
-    print("Chutni MCP checks: 26 passed, 0 failed")
+    print("Chutni MCP checks: 44 passed, 0 failed")
 
 
 if __name__ == "__main__":

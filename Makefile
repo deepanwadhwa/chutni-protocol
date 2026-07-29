@@ -46,7 +46,7 @@ $(MCP): $(BUILD)/src/mcp.o $(LIBCHUTNI)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) -lpthread
 
 # First-party code is held to -Werror.
-$(BUILD)/src/%.o: src/%.c
+$(BUILD)/src/%.o: src/%.c include/chutni.h src/cj.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(B3FLAGS) $(SQLFLAGS) -c $< -o $@
 

@@ -8,10 +8,10 @@ model. Samosa is the first guinea-pig host, not a privileged implementation.
 
 | Component | Responsibility |
 |---|---|
-| Host application | Finds, creates, opens, updates, searches, and validates the store; enforces permissions |
+| Host application | Finds, creates, opens, updates, and searches the store; runs its parsers/models and enforces permissions |
 | Language model | Suggests queries or produces derived content; never writes catalog rows directly |
-| Chutni store | Holds portable sources, artifacts, provenance, representations, and disposable indexes |
-| `chutni-mcp` or another adapter | Maps MCP or a native process call onto the same Chutni operations |
+| Chutni store | Holds portable sources, producer-attributed artifacts, provenance, representations, and disposable indexes |
+| `chutni-mcp` or another adapter | Validates record structure, source-version binding, and integrity; never judges semantic truth |
 
 The host can link `libchutni`, invoke a conforming local service, or implement
 the format itself. The result on disk must be the same protocol-defined store.
@@ -38,14 +38,18 @@ The service exposes this stable application surface:
 | `chutni_folder_status` | Classify a selected source/store and report the safe next action | no |
 | `chutni_folder_activate` | After confirmation, create/open, authorize, register, and scan | yes |
 | `chutni_discover` | Find bounded, registered/conventional stores | no |
+| `chutni_capabilities` | Report versions, artifact/selector support, scanner limits, and writer policy | no |
 | `chutni_store_info` | Read identity, roots, and catalog counts | no |
 | `chutni_scan` | Rescan already-authorized roots and retire stale artifacts | yes |
 | `chutni_search` | Retrieve current bounded excerpts with paths and provenance | no |
+| `chutni_source_context` | Read all current interpretations of one source with processing history | no |
+| `chutni_put_artifacts` | Atomically retain host-produced artifacts with complete processing provenance | yes |
 | `chutni_put_model_artifact` | Retain approved model output with complete derivation provenance | yes |
 
-The three write operations that scan or retain model output require an explicit
-`confirmed: true`. A host must set it only after the corresponding user action;
-the service does not treat a model tool call as permission.
+Write operations that scan or retain outputs require an explicit
+`confirmed: true`. A host must set it only after the corresponding user action
+or an already-approved memory policy; the service does not treat a model tool
+call as permission.
 
 ### What the end user does in a bundled application
 
@@ -121,13 +125,14 @@ During a scan:
 ```text
 for each allowed file:
     source = add_or_update_source(locator, blake3(file_bytes))
+    ensure file_metadata exists
 
     if source bytes are unchanged:
         reuse current compatible artifacts
     else:
         stale artifacts for the prior hash
-        run deterministic extraction first
-        record producer + derivation + new artifacts
+        host runs its deterministic/model processing
+        put_artifacts(producer, derivation, new artifacts)
 
 rebuild disposable indexes as needed
 ```
@@ -147,6 +152,39 @@ model identity, revision, runtime/application identity, recipe, parameters,
 inputs, source hash, and selector. Merely receiving model text is not a valid
 Chutni write.
 
+The same operation is used for deterministic processing. For example, a PDF
+parser submits `page_text` with `operation: "pdf_text_extract"` and page
+selectors; an OCR engine submits `ocr_text` with `operation: "ocr"`; a model
+submits `image_caption` or `summary_short` with its model identity. Chutni
+checks that the records are well formed and describe the current source hash.
+It does not check whether the extracted or generated words are correct.
+
+Different producers append separate artifacts. App B does not overwrite App
+A merely because it has another interpretation. A later consumer calls
+`chutni_source_context` and can inspect both versions, their creation times,
+selectors, operations, and producer identities.
+
+The transport-neutral producer loop is:
+
+```text
+context = chutni_source_context(store, source)
+bytes = open(context.source.display_path)
+outputs = host_parser_or_model(bytes)
+chutni_put_artifacts(
+    source_content_hash=context.source.content_hash,
+    producer=host_producer_identity,
+    operation=processing_method,
+    inputs=[source/artifact references],
+    artifacts=outputs,
+    confirmed=true
+)
+```
+
+The expected source hash closes the race between processing and committing. If
+the file changed meanwhile, Chutni refuses the batch instead of attaching old
+output to new bytes. The complete producer, derivation, and artifact batch is
+committed atomically.
+
 ## Reference C API mapping
 
 The current reference library maps the host loop to:
@@ -158,6 +196,7 @@ chutni_root_add
 chutni_source_put / chutni_source_refresh
 chutni_producer_put / chutni_derivation_put
 chutni_artifact_put
+chutni_artifacts_put
 chutni_rebuild_indexes
 chutni_search / chutni_search_semantic
 chutni_check_freshness

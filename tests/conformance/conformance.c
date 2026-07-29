@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int passes = 0, failures = 0, gaps = 0;
@@ -63,6 +64,21 @@ static void p(char *out, size_t cap, const char *rel) {
     snprintf(out, cap, "%s/%s", root_dir, rel);
 }
 
+static int parser_derivation(chutni_store *store, const char *operation,
+                             char derivation_id[CHUTNI_ID_STRLEN]) {
+    chutni_producer producer;
+    memset(&producer, 0, sizeof producer);
+    producer.producer_kind = "parser";
+    producer.name = "chutni-conformance-parser";
+    producer.version = "1";
+    producer.app_name = "chutni-conformance";
+    producer.app_version = "1";
+    char producer_id[CHUTNI_ID_STRLEN];
+    return chutni_producer_put(store, &producer, producer_id) == CHUTNI_OK &&
+           chutni_derivation_put(store, producer_id, operation, NULL, "{}",
+                                 "[]", derivation_id) == CHUTNI_OK;
+}
+
 /* 1. A minimal valid store. */
 static void scenario_minimal(void) {
     char store[512], path[600];
@@ -78,6 +94,33 @@ static void scenario_minimal(void) {
         if (access(path, F_OK) != 0) { all = 0; printf("        missing %s\n", *r); }
     }
     check("1 minimal valid store", all, "§8 layout present");
+
+    chutni_store *reader = NULL, *second_writer = NULL;
+    check("1 concurrent reader opens while writer is active",
+          chutni_open(store, 1, &reader) == CHUTNI_OK,
+          "many readers are allowed");
+    check("1 second writer is refused safely",
+          chutni_open(store, 0, &second_writer) == CHUTNI_ERR_BUSY,
+          "single-writer coordination");
+    chutni_close(reader);
+    chutni_close(second_writer);
+
+    pid_t child = fork();
+    if (child == 0) {
+        /* The inherited descriptor shares the parent's lock; a fresh handle
+           in this process must not acquire a second independent writer lock. */
+        chutni_store *child_writer = NULL;
+        chutni_status child_status =
+            chutni_open(store, 0, &child_writer);
+        chutni_close(child_writer);
+        _exit(child_status == CHUTNI_ERR_BUSY ? 0 : 1);
+    }
+    int child_status = 0;
+    int waited = child > 0 ? waitpid(child, &child_status, 0) : -1;
+    check("1 separate process is refused while writer is active",
+          waited == child && WIFEXITED(child_status) &&
+          WEXITSTATUS(child_status) == 0,
+          "multi-application writer safety");
     chutni_close(s);
 
     /* And it reopens. */
@@ -148,6 +191,9 @@ static void scenario_changed_source(void) {
     a.media_type = "text/plain";
     a.inline_text = "original content about telescopes";
     a.source_content_hash = hash;
+    char derivation_id[CHUTNI_ID_STRLEN];
+    parser_derivation(s, "extract_text", derivation_id);
+    a.derivation_id = derivation_id;
     chutni_artifact_put(s, &a, artifact_id);
 
     const char *fresh = NULL;
@@ -342,6 +388,9 @@ static void scenario_missing_source(void) {
     a.artifact_origin = "deterministic_transform";
     a.inline_text = "this file will be deleted";
     a.source_content_hash = hash;
+    char derivation_id[CHUTNI_ID_STRLEN];
+    parser_derivation(s, "extract_text", derivation_id);
+    a.derivation_id = derivation_id;
     chutni_artifact_put(s, &a, artifact_id);
 
     unlink(file);
@@ -363,6 +412,158 @@ static void scenario_missing_source(void) {
     chutni_list_artifacts(s, source_id, &arts, &an);
     check("7 artifacts retained after deletion", an == 1, "§24.2 historical memory");
     chutni_artifact_info_free(arts, an);
+    chutni_close(s);
+}
+
+/* 8. Rich artifacts come from hosts, coexist, and retain their provenance.
+ *
+ * The fixture intentionally gives the model a false interpretation. Chutni
+ * must preserve who said it and which bytes it describes without pretending
+ * to adjudicate the claim. */
+static void scenario_rich_artifact_handoff(void) {
+    char store[512], dir[512], file[600];
+    p(store, sizeof store, "rich-artifacts.chutni");
+    p(dir, sizeof dir, "rich_artifacts_src");
+    mkdir(dir, 0700);
+    snprintf(file, sizeof file, "%s/paper.pdf", dir);
+    write_file(file, "This document discusses orbital mechanics.\n");
+
+    chutni_store *s = NULL;
+    chutni_create(store, NULL, &s);
+    char root_id[CHUTNI_ID_STRLEN], source_id[CHUTNI_ID_STRLEN];
+    chutni_root_add(s, dir, NULL, NULL, root_id);
+    chutni_scan_options scan_options;
+    memset(&scan_options, 0, sizeof scan_options);
+    scan_options.app_name = "host-a";
+    scan_options.app_version = "1";
+    chutni_scan_result scan_result;
+    chutni_scan(s, &scan_options, &scan_result);
+    chutni_source_find(s, file, source_id);
+
+    char source_hash[CHUTNI_HASH_STRLEN];
+    chutni_hash_file(file, source_hash);
+    chutni_producer parser;
+    memset(&parser, 0, sizeof parser);
+    parser.producer_kind = "parser";
+    parser.name = "Host A PDF parser";
+    parser.version = "4.2";
+    parser.app_name = "host-a";
+    parser.app_version = "1";
+    chutni_artifact page;
+    memset(&page, 0, sizeof page);
+    page.source_id = source_id;
+    page.artifact_kind = "page_text";
+    page.artifact_origin = "deterministic_transform";
+    page.media_type = "text/plain; charset=utf-8";
+    page.inline_text = "This document discusses orbital mechanics.";
+    page.selector_json = "{\"type\":\"pages\",\"start\":1,\"end\":1}";
+    page.source_content_hash = source_hash;
+    char parser_id[CHUTNI_ID_STRLEN], parser_derivation[CHUTNI_ID_STRLEN];
+    char page_ids[1][CHUTNI_ID_STRLEN];
+    int parser_stored =
+        chutni_artifacts_put(
+            s, &parser, "pdf_text_extract", "recipe:pdf-parser-v4",
+            "{\"embedded_text\":true}",
+            "[{\"source_role\":\"document\"}]", &page, 1, parser_id,
+            parser_derivation, page_ids) == CHUTNI_OK;
+    check("8 host A contributes PDF page text", parser_stored,
+          "host performs extraction; Chutni records it");
+
+    chutni_producer model;
+    memset(&model, 0, sizeof model);
+    model.producer_kind = "model";
+    model.name = "Host B local model";
+    model.model_id = "example/interpretation-model";
+    model.model_revision = "revision-2";
+    model.runtime = "host-b-runtime";
+    model.app_name = "host-b";
+    model.app_version = "2";
+    chutni_artifact summary;
+    memset(&summary, 0, sizeof summary);
+    summary.source_id = source_id;
+    summary.artifact_kind = "summary_short";
+    summary.artifact_origin = "model_generated";
+    summary.media_type = "text/plain; charset=utf-8";
+    summary.inline_text = "This PDF is about a dog.";
+    summary.source_content_hash = source_hash;
+    char model_id[CHUTNI_ID_STRLEN], model_derivation[CHUTNI_ID_STRLEN];
+    char summary_ids[1][CHUTNI_ID_STRLEN];
+    int model_stored =
+        chutni_artifacts_put(
+            s, &model, "summarize", "recipe:host-b-summary",
+            "{\"temperature\":0.2}",
+            "[{\"artifact_role\":\"page_text\"}]", &summary, 1,
+            model_id, model_derivation, summary_ids) == CHUTNI_OK;
+    check("8 host B contributes a separate interpretation", model_stored,
+          "append, do not overwrite Host A");
+
+    chutni_artifact_info *artifacts = NULL;
+    size_t artifact_count = 0;
+    chutni_list_artifacts(s, source_id, &artifacts, &artifact_count);
+    int metadata_seen = 0, parser_seen = 0, model_seen = 0;
+    int timestamps_seen = 0, both_active = 0;
+    for (size_t i = 0; i < artifact_count; i++) {
+        if (artifacts[i].artifact_kind &&
+            !strcmp(artifacts[i].artifact_kind, "file_metadata"))
+            metadata_seen = 1;
+        if (artifacts[i].artifact_id &&
+            !strcmp(artifacts[i].artifact_id, page_ids[0]) &&
+            artifacts[i].operation &&
+            !strcmp(artifacts[i].operation, "pdf_text_extract") &&
+            artifacts[i].producer_name &&
+            !strcmp(artifacts[i].producer_name, "Host A PDF parser"))
+            parser_seen = 1;
+        if (artifacts[i].artifact_id &&
+            !strcmp(artifacts[i].artifact_id, summary_ids[0]) &&
+            artifacts[i].inline_text &&
+            !strcmp(artifacts[i].inline_text,
+                    "This PDF is about a dog.") &&
+            artifacts[i].model_id &&
+            !strcmp(artifacts[i].model_id,
+                    "example/interpretation-model"))
+            model_seen = 1;
+        if (artifacts[i].created_at &&
+            artifacts[i].derivation_created_at)
+            timestamps_seen++;
+    }
+    both_active = parser_stored && model_stored;
+    for (size_t i = 0; both_active && i < artifact_count; i++)
+        if ((artifacts[i].artifact_id &&
+             (!strcmp(artifacts[i].artifact_id, page_ids[0]) ||
+              !strcmp(artifacts[i].artifact_id, summary_ids[0]))) &&
+            (!artifacts[i].status ||
+             strcmp(artifacts[i].status, "active")))
+            both_active = 0;
+    check("8 every source keeps base file metadata", metadata_seen,
+          "file_metadata exists independently of extraction");
+    check("8 App C sees Host A processing provenance", parser_seen,
+          "method, producer, selector, and source hash");
+    check("8 App C sees Host B model provenance", model_seen,
+          "claim is preserved, not certified");
+    check("8 producer interpretations coexist", both_active,
+          "distinct producers remain active");
+    check("8 artifacts and derivations are timestamped",
+          timestamps_seen >= 3, "creation history is visible");
+    chutni_artifact_info_free(artifacts, artifact_count);
+
+    chutni_counts before, after;
+    chutni_store_counts(s, &before);
+    chutni_artifact invalid = page;
+    invalid.inline_text = "must not be partially committed";
+    invalid.source_content_hash =
+        "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+    char invalid_producer[CHUTNI_ID_STRLEN];
+    char invalid_derivation[CHUTNI_ID_STRLEN];
+    char invalid_ids[1][CHUTNI_ID_STRLEN];
+    int refused =
+        chutni_artifacts_put(
+            s, &parser, "pdf_text_extract", NULL, "{}", "[]", &invalid, 1,
+            invalid_producer, invalid_derivation, invalid_ids) != CHUTNI_OK;
+    chutni_store_counts(s, &after);
+    check("8 wrong source version is refused atomically",
+          refused && before.artifacts == after.artifacts &&
+          before.derivations == after.derivations,
+          "integrity validation, not semantic validation");
     chutni_close(s);
 }
 
@@ -466,6 +667,9 @@ static void scenario_prompt_injection(void) {
     a.media_type = "text/plain";
     a.inline_text = attack;
     a.source_content_hash = hash;
+    char derivation_id[CHUTNI_ID_STRLEN];
+    parser_derivation(s, "extract_text", derivation_id);
+    a.derivation_id = derivation_id;
     chutni_artifact_put(s, &a, artifact_id);
     chutni_rebuild_indexes(s);
 
@@ -524,6 +728,8 @@ static void scenario_representation_compatibility(void) {
     };
     char artifact_ids[4][CHUTNI_ID_STRLEN];
     char representation_ids[4][CHUTNI_ID_STRLEN];
+    char derivation_id[CHUTNI_ID_STRLEN];
+    parser_derivation(s, "prepare_embedding_text", derivation_id);
     for (int i = 0; i < 4; i++) {
         chutni_artifact a;
         memset(&a, 0, sizeof a);
@@ -533,6 +739,7 @@ static void scenario_representation_compatibility(void) {
         a.media_type = "text/plain";
         a.inline_text = texts[i];
         a.source_content_hash = source_hash;
+        a.derivation_id = derivation_id;
         if (chutni_artifact_put(s, &a, artifact_ids[i]) != CHUTNI_OK) {
             bad("12 representation compatibility", "artifact put failed");
             chutni_close(s);
@@ -809,7 +1016,7 @@ int main(int argc, char **argv) {
     scenario_multiple_producers();
     scenario_shared_objects();
     scenario_missing_source();
-    gap("8 image/spreadsheet/audio examples", "only text extraction exists; §25.2-25.4 unbuilt");
+    scenario_rich_artifact_handoff();
     scenario_invalid_hashes();
     scenario_path_encoding();
     scenario_prompt_injection();

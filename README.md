@@ -36,13 +36,16 @@ Honest summary of what runs today, on one machine (macOS 15 / arm64, Apple M3).
 | Sources, artifacts, producers, derivations (§12, §15, §16) | built, tested |
 | Freshness and staleness (§13.2–§13.3) | built, tested; search uses a cheap stat downgrade |
 | Supersession and multi-producer artifacts (§23) | built, tested |
+| Generic host artifact batches and grouped source context | built, tested |
+| Single-writer/many-reader application coordination | built, tested across processes |
 | Lexical search, FTS5 (§19) | built, tested |
 | Store discovery and registry (§39) | built, tested |
 | Forget modes (§24.3) | built, lightly tested |
 | Representations — f32 embeddings (§17) | built, tested; producer-supplied vectors |
 | Root remapping across machines (§26) | **not built** |
 | `.chutnipack` transfer bundles (§7.2) | **not built** |
-| Image, audio, spreadsheet ingestion (§25.2–§25.4) | **not built** |
+| Host-produced PDF/OCR/image/spreadsheet/audio artifact interchange | built, tested; extraction remains the host's job |
+| Reference scanner PDF/OCR/image/spreadsheet/audio extraction | intentionally not provided; hosts submit those outputs |
 | Semantic search (§19.1) | built in the C API as brute-force cosine; hybrid search is not built |
 | Application Host lifecycle (§30.5, §40) | specified, documented, handoff scenario tested |
 | Reusable local service (`chutni-mcp`) | built; MCP stdio and native one-shot modes tested |
@@ -98,10 +101,13 @@ an app linking the C library ─────────────────
 ```
 
 For MCP hosts, configure `build/chutni-mcp` as a local stdio server. It
-advertises seven tools covering folder status and activation, discovery, store
-inspection, scanning, searching, and provenance-complete model artifacts.
-Search defaults to precise all-term matching; hosts deriving queries from prose
-can request literal any-term matching without exposing FTS operator syntax.
+advertises ten tools covering capability discovery, folder status and
+activation, store discovery and inspection, scanning, searching, grouped
+source context, generic
+provenance-complete artifact batches, and a compatibility helper for individual
+model artifacts. Search defaults to precise all-term matching; hosts deriving
+queries from prose can request literal any-term matching without exposing FTS
+operator syntax.
 
 Native applications that already supervise child processes can call the exact
 same implementation without embedding an MCP client:
@@ -121,6 +127,15 @@ Both modes return structured JSON and operate on the same protocol-defined
 store. `stdout` is reserved for protocol output; diagnostics use `stderr`.
 Applications normally ship this executable with their own installer, so their
 end users do not need a separate Chutni installation.
+
+The reference scan creates a `file_metadata` artifact for every file and
+extracts text-like UTF-8 files. Applications with PDF, OCR, vision,
+spreadsheet, or speech capabilities submit their outputs through
+`chutni_put_artifacts`. Each artifact records the processing operation,
+producer/model/application, selector, exact source hash, and creation time.
+`chutni_source_context` returns all current interpretations together. Chutni
+validates those records and their source binding; it deliberately does not
+decide whether an interpretation is true.
 
 ## For AI applications
 

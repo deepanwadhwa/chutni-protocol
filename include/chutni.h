@@ -6,7 +6,9 @@
  *
  * Threading: a chutni_store handle is not thread-safe. Open one handle per
  * thread, or serialize access. Multiple processes may hold read handles on the
- * same store concurrently; SQLite WAL mode arbitrates writers.
+ * same store concurrently. A read-write handle holds the store's advisory
+ * single-writer lock until close, so another writer receives CHUTNI_ERR_BUSY
+ * instead of interleaving catalog, object, and index changes.
  *
  * Ownership: every function returning heap memory documents its free function.
  * Strings are NUL-terminated UTF-8.
@@ -39,7 +41,8 @@ typedef enum {
     CHUTNI_ERR_NOMEM = -7,
     CHUTNI_ERR_DENIED = -8,    /* policy or permission refused the operation */
     CHUTNI_ERR_EXISTS = -9,
-    CHUTNI_ERR_READONLY = -10
+    CHUTNI_ERR_READONLY = -10,
+    CHUTNI_ERR_BUSY = -11       /* another process owns the store's writer lock */
 } chutni_status;
 
 typedef struct chutni_store chutni_store;
@@ -286,6 +289,23 @@ typedef struct {
     char *model_id;
     char *model_revision;
     char *operation;
+    /* Appended in ABI order after the original v0.1 fields. */
+    char *language;
+    char *metadata_json;
+    char *supersedes_artifact_id;
+    char *producer_id;
+    char *producer_version;
+    char *weights_hash;
+    char *quantization;
+    char *runtime;
+    char *app_name;
+    char *app_version;
+    char *producer_details_json;
+    char *derivation_id;
+    char *recipe_hash;
+    char *parameters_json;
+    char *input_refs_json;
+    char *derivation_created_at;
 } chutni_artifact_info;
 
 chutni_status chutni_list_artifacts(chutni_store *store, const char *source_id,
@@ -330,6 +350,31 @@ typedef struct {
 chutni_status chutni_artifact_put(chutni_store *store,
                                   const chutni_artifact *artifact,
                                   char artifact_id[CHUTNI_ID_STRLEN]);
+
+/* Atomically record one producer, one derivation, and one or more artifacts.
+ *
+ * This is the generic host-ingestion primitive: PDF parsers, OCR engines,
+ * multimodal models, spreadsheet readers, speech recognizers, and humans all
+ * submit the same protocol records. Chutni validates structure, referential
+ * integrity, source-version binding, and provenance completeness. It does not
+ * judge whether submitted text, captions, summaries, or other claims are true.
+ *
+ * Every artifact in the batch receives the created derivation_id. Each must
+ * identify an existing source and its exact current source_content_hash.
+ * `artifact_ids` points to artifact_count caller-owned ID buffers.
+ */
+chutni_status chutni_artifacts_put(
+    chutni_store *store,
+    const chutni_producer *producer,
+    const char *operation,
+    const char *recipe_hash,
+    const char *parameters_json,
+    const char *input_refs_json,
+    const chutni_artifact *artifacts,
+    size_t artifact_count,
+    char producer_id[CHUTNI_ID_STRLEN],
+    char derivation_id[CHUTNI_ID_STRLEN],
+    char (*artifact_ids)[CHUTNI_ID_STRLEN]);
 
 /* ----------------------------------------------------------- representations
  *

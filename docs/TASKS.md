@@ -2,7 +2,8 @@
 
 **Last updated:** 2026-07-29
 **Spec:** [SPEC.md](../SPEC.md) v0.1-draft
-**Evidence:** [evidence/2026-07-29-v0.1/](evidence/2026-07-29-v0.1/)
+**Evidence:** [v0.1 baseline](evidence/2026-07-29-v0.1/) and
+[generic artifact interchange](evidence/2026-07-29-generic-artifacts/report.md)
 
 Read [../CLAUDE.md](../CLAUDE.md) first. This document says what exists, what
 does not, and what to do next. Keep it accurate — it is the thing that stops
@@ -13,9 +14,9 @@ the next session from claiming a feature that was never built.
 ## 1. What is built
 
 All verified on macOS 15 (Darwin arm64, Apple clang 21.0.0) — **the only
-machine this has ever run on**. `make test`: 105 BLAKE3 checks, 41 conformance
-assertions, 16 CLI checks, and 26 reusable-service checks, with 0 failures and
-2 declared gaps. `make sanitize` re-runs the conformance, CLI, and service
+machine this has ever run on**. `make test`: 105 BLAKE3 checks, 52 conformance
+assertions, 16 CLI checks, and 44 reusable-service checks, with 0 failures and
+1 declared gap. `make sanitize` re-runs the conformance, CLI, and service
 suites under ASan + UBSan, also clean.
 
 | Area | Spec | State |
@@ -29,7 +30,11 @@ suites under ASan + UBSan, also clean.
 | Content-addressed objects, corruption detection | §14 | built, tested |
 | Artifacts, origins, statuses | §15 | built, tested |
 | Producers, derivations, per-artifact provenance | §16 | built, tested |
+| Generic atomic artifact batches from arbitrary hosts | §16, §20 | built, tested |
+| Grouped source context with all producer interpretations | §20, §23 | built, tested |
 | Supersession, multi-producer artifacts | §23 | built, tested |
+| Base `file_metadata` for every scanned file | §15.2 | built, tested |
+| Single-writer/many-reader coordination | §21, §28 | built, tested across processes |
 | Forget modes | §24.3 | built, lightly tested |
 | Lexical search over FTS5 | §19 | built, tested |
 | Producer-supplied f32 representations and profile gating | §17, §22.6 | built, tested |
@@ -63,12 +68,11 @@ relevant §31 scenarios as `GAP`.
 | **Root remapping** across machines | §26 | A store copied to another computer cannot have its roots re-pointed. |
 | **`.chutnipack` transfer bundles** | §7.2 | `chutni pack` does not exist. |
 | **Relations** | §18 | Table exists; nothing writes or reads it. No `duplicate_of`, `contains`, etc. |
-| **Non-text ingestion** — images, audio, spreadsheets, archives | §25.2–25.4 | Non-text files get a `file_metadata` artifact only. No OCR, captions, transcripts, or sheet inventories. |
-| **Selectors in practice** | §15.3 | Column is written and read, but nothing produces page/region/time selectors because nothing parses those formats. |
+| **Convenience extractors beyond UTF-8 text** | §25 | The reference scanner does not parse PDFs, run OCR, caption images, inspect spreadsheets, or transcribe audio. This is intentionally host work, not a protocol gap; hosts can submit all of those artifacts and selectors through the generic service. |
 | **Disclosure enforcement** | §27, §30.4 | The manifest records `external_disclosure_default: deny`; the local service never sends network traffic, but a cloud-facing host still has to enforce disclosure policy before forwarding excerpts. |
 | **Archive safety** | §28.3 | No archive extraction exists yet, so no zip-bomb or traversal defenses. Needed before §25 archive support. |
 | **Windows support** | §26 | POSIX-only: `/dev/urandom`, `lstat`, `realpath`, forward-slash paths. Never compiled on Windows. |
-| **Concurrency testing** | — | WAL is on and busy-timeout is set, but multi-process access has never been tested. |
+| **Concurrency stress testing** | — | Cross-process writer exclusion and concurrent readers are tested. Long-running many-reader/write and crash-interruption stress tests remain. |
 | **Fuzzing** | — | `make sanitize` is clean, but only over the suite's own fixtures. No malformed manifest, truncated catalog, or hostile object has been fuzzed at the parsers. |
 
 ## 3. Work list
@@ -109,17 +113,26 @@ Chutni does not compute embeddings; a producer supplies them. Keep it that way.
 - **P4** — decide what a store carried between machines does about
   `file_identity_json`, which §12.3 says is not portable.
 
-### Phase M — multimodal ingestion (§25)
+### Phase M — rich artifact interchange (§15, §16, §20, §25)
 
-Each of these makes a real difference to whether the store is useful, and each
-needs a parser the project does not currently have.
+Chutni records outputs from host parsers and models; it does not own those
+extractors or judge their semantic truth.
 
-- **M1** — images: metadata, perceptual hash, thumbnail. No model needed.
-- **M2** — spreadsheets: sheet inventory and schema, *without* flattening to
-  text (§25.4 is explicit about this).
-- **M3** — PDFs: page text and `page_text` artifacts with page selectors.
-- **M4** — archives: listing only, with the §28.3 defenses in place first.
-- **M5** — conformance scenario 8, currently GAP.
+- ~~**M1**~~ — **done 2026-07-29.** `chutni_artifacts_put` and
+  `chutni_put_artifacts` atomically record producer, derivation, exact source
+  hash, selector, timestamp, and one or more artifacts.
+- ~~**M2**~~ — **done 2026-07-29.** `chutni_source_context` returns all current
+  interpretations together with complete processing provenance and an explicit
+  `semantic_validation: "not_performed"` marker.
+- ~~**M3**~~ — **done 2026-07-29.** Every reference-scanned file receives base
+  `file_metadata`, whether or not the scanner can extract its contents.
+- ~~**M4**~~ — **done 2026-07-29.** Conformance scenario 8 proves that one host
+  can submit PDF page text, a second can append a model interpretation, and a
+  third can consume both without either being declared correct by Chutni.
+
+PDF parsing, OCR, image understanding, spreadsheet reading, archive parsing,
+and speech recognition belong in host applications or optional producer
+packages. They are not pending Chutni core work.
 
 ### Phase G — service and disclosure (§27, §30.4)
 
@@ -160,8 +173,9 @@ producer can reuse; its **storage layer** is what differs.
 - ~~**S1**~~ — **done 2026-07-29.** Samosa pins and bundles `chutni-mcp`;
   selecting `P` checks, creates/opens, scans, and searches the adjacent
   `P.chutni` through the shared service.
-- **S2** — a Samosa producer that writes conformant artifacts, with its models
-  recorded as §16.2 producers (model id, revision, quantization, runtime).
+- **S2** — external host-adoption work: Samosa may submit its own parser/model
+  outputs through `chutni_put_artifacts`. No Samosa code belongs in this
+  repository.
 - ~~**S3**~~ — **done 2026-07-29.** The Samosa gateway retired its schema-v2
   sidecar from the live path. It keeps presentation/job metadata only; the
   legacy source remains for standalone migration tests and is not packaged.
@@ -194,7 +208,10 @@ Not blocking, but they will need answers before v0.2.
   results are not called `stale` either — proving that needs a re-hash, which is
   what `chutni verify` is for. CLI check: "edited file is not called current
   before verify".
-- **No conflict resolution for simultaneous writers** (§37.7). Two applications
-  writing one store concurrently is untested.
+- ~~**Uncoordinated simultaneous writers.**~~ **Answered 2026-07-29.** A
+  read-write handle now owns an advisory store lock; concurrent readers remain
+  allowed and a second process receives `CHUTNI_ERR_BUSY`. Distributed merge
+  or synchronized multi-writer conflict resolution remains a v0.2 question,
+  not a local-store requirement.
 - **`skills/` needs a real test.** The instructions have never been run through
   an actual agent against a real store. Until they have, they are a hypothesis.
