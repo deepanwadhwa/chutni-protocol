@@ -167,6 +167,17 @@ static int is_dir(const char *path) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/* Nanosecond mtime, which every platform spells differently. */
+static long long stat_mtime_ns(const struct stat *st) {
+#if defined(__APPLE__)
+    return (long long)st->st_mtimespec.tv_sec * 1000000000ll + st->st_mtimespec.tv_nsec;
+#elif defined(st_mtime)
+    return (long long)st->st_mtim.tv_sec * 1000000000ll + st->st_mtim.tv_nsec;
+#else
+    return (long long)st->st_mtime * 1000000000ll;
+#endif
+}
+
 static int write_atomic(const char *path, const char *data, size_t len) {
     char tmp[PATH_MAX];
     if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", path) >= sizeof tmp) return 0;
@@ -1313,12 +1324,7 @@ chutni_status chutni_source_put(chutni_store *s, const char *root_id, const char
 
     const char *base = strrchr(abs, '/');
     base = base ? base + 1 : abs;
-    long long mtime_ns = (long long)st.st_mtime * 1000000000ll;
-#if defined(__APPLE__)
-    mtime_ns = (long long)st.st_mtimespec.tv_sec * 1000000000ll + st.st_mtimespec.tv_nsec;
-#elif defined(st_mtime)
-    mtime_ns = (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec;
-#endif
+    long long mtime_ns = stat_mtime_ns(&st);
 
     if (prev_id[0]) {
         snprintf(source_id, CHUTNI_ID_STRLEN, "%s", prev_id);
@@ -1810,7 +1816,7 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
         "       snippet(artifacts_fts, 4, '', '', '…', 12),"
         "       bm25(artifacts_fts),"
         "       a.status, a.source_content_hash, a.selector_json, s.content_hash, s.media_type,"
-        "       d.producer_id"
+        "       d.producer_id, s.size_bytes, s.mtime_ns"
         " FROM idx.artifacts_fts"
         " JOIN artifacts a ON a.artifact_id=artifacts_fts.artifact_id"
         " JOIN sources s ON s.source_id=a.source_id"
@@ -1866,6 +1872,28 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
         const char *fresh = "unknown";
         if (status && strcmp(status, "active")) fresh = "stale";
         else if (ah && sh) fresh = strcmp((const char *)ah, (const char *)sh) ? "stale" : "current";
+
+        /* Both hashes above are catalog state, so they agree with each other
+           even when the file has moved on and nothing has rescanned it — the
+           mistake this format exists to prevent. Re-hashing every hit is too
+           expensive for search, but a stat is not: if size or mtime no longer
+           match what the scan recorded, the catalog's "current" is unproven.
+
+           Such a result is reported "unverified", not "stale". §13.2 forbids a
+           quick signal from establishing validity, and that cut both ways here:
+           a stat cannot prove the bytes differ either, because touching a file
+           changes mtime without changing content. So a stat may only withdraw
+           a claim, never make one. Callers who need the answer re-hash with
+           chutni_check_freshness or chutni verify. */
+        if (!strcmp(fresh, "current") && r->display_path[0]) {
+            struct stat st;
+            if (stat(r->display_path, &st) != 0) {
+                fresh = "missing";
+            } else if ((int64_t)st.st_size != sqlite3_column_int64(q, 12) ||
+                       (long long)stat_mtime_ns(&st) != (long long)sqlite3_column_int64(q, 13)) {
+                fresh = "unverified";
+            }
+        }
         r->freshness = strdup(fresh);
         n++;
     }

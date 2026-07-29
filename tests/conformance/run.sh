@@ -79,8 +79,21 @@ check_output "verify reports all current" "0 stale" \
 check "empty store refuses to scan without a root" \
     sh -c "$CLI init '$WORK/Empty.chutni' >/dev/null && ! $CLI scan --store '$WORK/Empty.chutni'"
 
-# A changed file must not keep being served as current.
+# The window between a file changing and the next verify. The lexical index
+# still holds the old text, so the hit still comes back; what must not happen is
+# search calling it "current" on the strength of two catalog columns agreeing
+# with each other while the disk says otherwise.
 printf 'completely different text about penguins\n' > "$WORK/docs/terns.md"
+if "$CLI" search "arctic terns" --store "$WORK/Test.chutni" --json 2>&1 \
+        | grep -q '"freshness": *"unverified"'; then
+    printf '  pass  %s\n' "edited file is not called current before verify"
+    pass=$((pass + 1))
+else
+    printf '  FAIL  %s\n' "edited file is not called current before verify"
+    fail=$((fail + 1))
+fi
+
+# A changed file must not keep being served as current.
 "$CLI" verify --store "$WORK/Test.chutni" >/dev/null 2>&1 || true
 if "$CLI" search "arctic terns" --store "$WORK/Test.chutni" 2>&1 | grep -q "No matches"; then
     printf '  pass  %s\n' "stale content withdrawn after verify"

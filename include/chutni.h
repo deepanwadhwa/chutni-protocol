@@ -310,6 +310,14 @@ typedef struct {
     char  *snippet;
     char  *producer_id;
     char  *selector_json;
+    /* "current", "stale", "missing", "unverified", or "unknown".
+     *
+     * "unverified" means the catalog considers the artifact current but the
+     * file's size or mtime no longer match what the scan recorded, so that
+     * judgement rests on catalog state the disk contradicts. Search does not
+     * re-hash — that is what chutni_check_freshness is for — and a stat can
+     * withdraw a claim of currency but never establish one (§13.2). Treat
+     * "unverified" as "reopen the source before quoting it". */
     char  *freshness;
     double score;
     char  *score_type;

@@ -155,11 +155,14 @@ Not blocking, but they will need answers before v0.2.
   root that is expensive. §13.2 permits a quick hash for change detection but
   forbids substituting it for `content_hash` when establishing validity — the
   cheap path is worth building, carefully.
-- **Search reports catalog freshness, not disk truth.** Between a file changing
-  and the next `verify`, a search result can still say `current`. This is
-  inherent to any index, and §6.1 answers it by telling consumers to reopen the
-  source for exact claims. Worth revisiting whether search should cheaply stat
-  files and downgrade obviously-drifted results.
+- ~~**Search reports catalog freshness, not disk truth.**~~ **Answered
+  2026-07-29.** Search now stats each hit and reports `unverified` when size or
+  mtime no longer match what the scan recorded, so the window between a file
+  changing and the next `verify` no longer produces a confident `current`. A
+  stat may only withdraw a claim, never establish one (§13.2), so drifted
+  results are not called `stale` either — proving that needs a re-hash, which is
+  what `chutni verify` is for. CLI check: "edited file is not called current
+  before verify".
 - **No conflict resolution for simultaneous writers** (§37.7). Two applications
   writing one store concurrently is untested.
 - **`skills/` needs a real test.** The instructions have never been run through

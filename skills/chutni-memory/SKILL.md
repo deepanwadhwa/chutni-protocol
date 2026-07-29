@@ -57,6 +57,9 @@ alone, tell the user you did that and did not open the source.
 - `current` — the file's bytes still match what was indexed.
 - `stale` — the file changed after indexing. The snippet describes content that
   may no longer exist. Open the file; do not quote the snippet.
+- `unverified` — the file's size or timestamp changed since it was indexed, so
+  the snippet may describe content that is gone. Search does not re-read files
+  to settle this. Treat it like `stale`: open the file before quoting it.
 - `missing` — the file is gone from disk.
 
 If results look stale, `chutni verify` re-checks the sources and withdraws
