@@ -1,0 +1,14 @@
+Chutni
+Copyright 2026 The Chutni authors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product bundles third-party code, compiled from source and unmodified:
+
+  BLAKE3 (third_party/blake3/)
+    Copyright the BLAKE3 team and contributors.
+    Dual-licensed under CC0-1.0 and Apache-2.0; see
+    third_party/blake3/LICENSE_CC0 and third_party/blake3/LICENSE_A2.
+
+  SQLite (third_party/sqlite/)
+    Public domain. https://www.sqlite.org/copyright.html

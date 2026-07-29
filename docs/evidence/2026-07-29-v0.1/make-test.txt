@@ -1,0 +1,69 @@
+$ uname -sm && cc --version | head -1
+Darwin arm64
+Apple clang version 21.0.0 (clang-2100.1.1.101)
+
+$ make clean && make
+ar rcs build/libchutni.a build/src/chutni.o build/src/cj.o build/third_party/blake3/blake3.o build/third_party/blake3/blake3_dispatch.o build/third_party/blake3/blake3_portable.o build/third_party/sqlite/sqlite3.o
+cc -std=c99 -Wall -Wextra -Wshadow -Wpointer-arith -Wwrite-strings -Werror -O2 -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite -o build/chutni build/src/cli.o build/libchutni.a -lpthread
+
+$ make test
+cc -std=c99 -O2 -Ithird_party/blake3 -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 tests/blake3_vectors.c build/third_party/blake3/blake3.o build/third_party/blake3/blake3_dispatch.o build/third_party/blake3/blake3_portable.o -o build/blake3_vectors
+cc -std=c99 -Wall -Wextra -Wshadow -Wpointer-arith -Wwrite-strings -Werror -O2 -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite tests/conformance/conformance.c build/libchutni.a -lpthread -o build/conformance
+BLAKE3: 35 vectors x 3 modes = 105 checks, 0 failures
+
+Chutni conformance suite — SPEC.md §31 (spec 0.1, library 0.1.0)
+
+  pass  1 minimal valid store                          §8 layout present
+  pass  1 minimal store reopens                        §30.1 reader
+  pass  2 unknown fields preserved                     §9.1 across rewrite
+  GAP   3 moved-root scenario                          root remapping is not implemented (§26)
+  pass  4 artifact starts current                      current
+  pass  4 changed source detected                      stale
+  pass  4 stale recorded, not just detected            stale
+  pass  4 stale artifact excluded from search          §15.4 active only
+  pass  5 distinct producers get distinct ids          §16.2
+  pass  5 superseded artifact retained                 §23
+  pass  5 superseding artifact active                  §23
+  pass  5 human artifact distinguishable               §23
+  pass  5 provenance names the model                   §16.2
+  pass  5 untraceable model artifact refused           §16.4
+  pass  6 identical payloads share one object          blake3:4595b879a45b4ad0d40522a303596d7441899fda43b3567491be4d83a4f4a821
+  pass  6 stored once, not twice                       objects table
+  pass  6 object round-trips                           
+  pass  7 deleted source reported missing              missing
+  pass  7 missing state persisted                      missing
+  pass  7 artifacts retained after deletion            §24.2 historical memory
+  GAP   8 image/spreadsheet/audio examples             only text extraction exists; §25.2-25.4 unbuilt
+  pass  9 malformed hash rejected                      
+  pass  9 wrong algorithm rejected                     
+  pass  9 path traversal rejected                      §28.8
+  pass  9 absent object reported not found             
+  pass  9 corrupt object detected on read              content re-hashed
+  pass  10 awkward filenames indexed                   
+  pass  10 awkward filenames resolve back              
+  pass  11 injection text retrievable as data          §6.5
+  pass  11 result attributed to its file               consumer can see the origin
+  GAP   12 representation compatibility                representations have no API yet (§17)
+
+28 passed, 0 failed, 3 gaps
+Gaps are unimplemented scenarios, not passes.
+
+Chutni CLI checks
+
+  pass  discover reports nothing on a fresh machine
+  pass  init creates a store
+  pass  discover finds the new store
+  pass  discover --json is well-formed
+  pass  add-root authorizes a directory
+  pass  scan indexes it
+  pass  search finds indexed content
+  pass  search --json reports a score_type
+  pass  inspect shows provenance
+  pass  verify reports all current
+  pass  empty store refuses to scan without a root
+  pass  stale content withdrawn after verify
+  pass  rescan picks up new content
+  pass  ambiguous store selection refuses to guess
+  pass  unregister removes a store from discovery
+
+15 passed, 0 failed

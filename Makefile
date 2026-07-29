@@ -1,0 +1,107 @@
+# Chutni reference implementation.
+#
+# Portable C99. No package manager, no build system beyond make: SQLite and
+# BLAKE3 are vendored under third_party/ and compiled from source.
+
+CC      ?= cc
+AR      ?= ar
+BUILD   ?= build
+PREFIX  ?= /usr/local
+
+WARN    := -std=c99 -Wall -Wextra -Wshadow -Wpointer-arith -Wwrite-strings -Werror
+OPT     ?= -O2
+CFLAGS  += $(WARN) $(OPT) -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite
+
+# The portable BLAKE3 build. Runtime SIMD dispatch is deliberately off: the
+# reference implementation values one identical code path everywhere over
+# throughput, and hashing has never been the bottleneck here.
+B3FLAGS := -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 \
+           -DBLAKE3_USE_NEON=0
+
+SQLFLAGS := -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=1 \
+            -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_ENABLE_JSON1
+
+LIB_SRC  := src/chutni.c src/cj.c
+LIB_OBJ  := $(LIB_SRC:%.c=$(BUILD)/%.o)
+B3_SRC   := third_party/blake3/blake3.c third_party/blake3/blake3_dispatch.c \
+            third_party/blake3/blake3_portable.c
+B3_OBJ   := $(B3_SRC:%.c=$(BUILD)/%.o)
+SQL_OBJ  := $(BUILD)/third_party/sqlite/sqlite3.o
+
+LIBCHUTNI := $(BUILD)/libchutni.a
+CLI       := $(BUILD)/chutni
+
+.PHONY: all clean test install conformance sanitize
+all: $(CLI)
+
+$(LIBCHUTNI): $(LIB_OBJ) $(B3_OBJ) $(SQL_OBJ)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $^
+
+$(CLI): $(BUILD)/src/cli.o $(LIBCHUTNI)
+	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) -lpthread
+
+# First-party code is held to -Werror.
+$(BUILD)/src/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(B3FLAGS) $(SQLFLAGS) -c $< -o $@
+
+# Vendored code is compiled as its authors shipped it: warnings there are not
+# ours to fix, and patching upstream to satisfy our flags makes updates painful.
+$(BUILD)/third_party/blake3/%.o: third_party/blake3/%.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=c99 $(OPT) -Ithird_party/blake3 $(B3FLAGS) -c $< -o $@
+
+$(BUILD)/third_party/sqlite/%.o: third_party/sqlite/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(OPT) -Ithird_party/sqlite $(SQLFLAGS) -c $< -o $@
+
+$(BUILD)/tests/%.o: tests/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(B3FLAGS) $(SQLFLAGS) -c $< -o $@
+
+# BLAKE3 checked against the official test vectors, not against itself.
+$(BUILD)/blake3_vectors: tests/blake3_vectors.c $(B3_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) -std=c99 $(OPT) -Ithird_party/blake3 $(B3FLAGS) $^ -o $@
+
+$(BUILD)/conformance: tests/conformance/conformance.c $(LIBCHUTNI)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $< $(LIBCHUTNI) -lpthread -o $@
+
+test: $(CLI) $(BUILD)/blake3_vectors $(BUILD)/conformance
+	@python3 tests/run_blake3_vectors.py $(BUILD)/blake3_vectors
+	@echo
+	@rm -rf $(BUILD)/conformance-work
+	@CHUTNI_HOME=$(BUILD)/conformance-work/home $(BUILD)/conformance $(BUILD)/conformance-work
+	@echo
+	@sh tests/conformance/run.sh $(CLI)
+
+conformance: test
+
+# This code parses untrusted file contents, so the suite is also run with the
+# sanitizers on. Built from source in one unit rather than reusing build/,
+# because sanitized and unsanitized objects must not be mixed.
+SAN      := -fsanitize=address,undefined -fno-omit-frame-pointer
+SAN_SRC  := $(LIB_SRC) $(B3_SRC) third_party/sqlite/sqlite3.c
+SAN_DEFS := -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite $(B3FLAGS) $(SQLFLAGS)
+
+sanitize:
+	@mkdir -p $(BUILD)/san
+	$(CC) -std=c99 -g -O1 $(SAN) $(SAN_DEFS) $(SAN_SRC) tests/conformance/conformance.c \
+	    -o $(BUILD)/san/conformance -lpthread
+	$(CC) -std=c99 -g -O1 $(SAN) $(SAN_DEFS) $(SAN_SRC) src/cli.c \
+	    -o $(BUILD)/san/chutni -lpthread
+	@rm -rf $(BUILD)/san/work $(BUILD)/san/home
+	@CHUTNI_HOME=$(BUILD)/san/home $(BUILD)/san/conformance $(BUILD)/san/work
+	@echo
+	@sh tests/conformance/run.sh $(BUILD)/san/chutni
+
+install: $(CLI)
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib
+	install -m 755 $(CLI) $(DESTDIR)$(PREFIX)/bin/chutni
+	install -m 644 include/chutni.h $(DESTDIR)$(PREFIX)/include/chutni.h
+	install -m 644 $(LIBCHUTNI) $(DESTDIR)$(PREFIX)/lib/libchutni.a
+
+clean:
+	rm -rf $(BUILD)
