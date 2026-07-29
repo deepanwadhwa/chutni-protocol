@@ -21,7 +21,7 @@ B3FLAGS := -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX51
 SQLFLAGS := -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=1 \
             -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_ENABLE_JSON1
 
-LIB_SRC  := src/chutni.c src/cj.c
+LIB_SRC  := src/chutni.c src/scan.c src/cj.c
 LIB_OBJ  := $(LIB_SRC:%.c=$(BUILD)/%.o)
 B3_SRC   := third_party/blake3/blake3.c third_party/blake3/blake3_dispatch.c \
             third_party/blake3/blake3_portable.c
@@ -30,15 +30,19 @@ SQL_OBJ  := $(BUILD)/third_party/sqlite/sqlite3.o
 
 LIBCHUTNI := $(BUILD)/libchutni.a
 CLI       := $(BUILD)/chutni
+MCP       := $(BUILD)/chutni-mcp
 
 .PHONY: all clean test install conformance sanitize
-all: $(CLI)
+all: $(CLI) $(MCP)
 
 $(LIBCHUTNI): $(LIB_OBJ) $(B3_OBJ) $(SQL_OBJ)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
 $(CLI): $(BUILD)/src/cli.o $(LIBCHUTNI)
+	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) -lpthread
+
+$(MCP): $(BUILD)/src/mcp.o $(LIBCHUTNI)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) -lpthread
 
 # First-party code is held to -Werror.
@@ -69,13 +73,15 @@ $(BUILD)/conformance: tests/conformance/conformance.c $(LIBCHUTNI)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(LIBCHUTNI) -lpthread -o $@
 
-test: $(CLI) $(BUILD)/blake3_vectors $(BUILD)/conformance
+test: $(CLI) $(MCP) $(BUILD)/blake3_vectors $(BUILD)/conformance
 	@python3 tests/run_blake3_vectors.py $(BUILD)/blake3_vectors
 	@echo
 	@rm -rf $(BUILD)/conformance-work
 	@CHUTNI_HOME=$(BUILD)/conformance-work/home $(BUILD)/conformance $(BUILD)/conformance-work
 	@echo
 	@sh tests/conformance/run.sh $(CLI)
+	@echo
+	@CHUTNI_MCP=$(MCP) python3 tests/test_mcp.py
 
 conformance: test
 
@@ -92,14 +98,19 @@ sanitize:
 	    -o $(BUILD)/san/conformance -lpthread
 	$(CC) -std=c99 -g -O1 $(SAN) $(SAN_DEFS) $(SAN_SRC) src/cli.c \
 	    -o $(BUILD)/san/chutni -lpthread
+	$(CC) -std=c99 -g -O1 $(SAN) $(SAN_DEFS) $(SAN_SRC) src/mcp.c \
+	    -o $(BUILD)/san/chutni-mcp -lpthread
 	@rm -rf $(BUILD)/san/work $(BUILD)/san/home
 	@CHUTNI_HOME=$(BUILD)/san/home $(BUILD)/san/conformance $(BUILD)/san/work
 	@echo
 	@sh tests/conformance/run.sh $(BUILD)/san/chutni
+	@echo
+	@CHUTNI_MCP=$(BUILD)/san/chutni-mcp python3 tests/test_mcp.py
 
-install: $(CLI)
+install: $(CLI) $(MCP)
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib
 	install -m 755 $(CLI) $(DESTDIR)$(PREFIX)/bin/chutni
+	install -m 755 $(MCP) $(DESTDIR)$(PREFIX)/bin/chutni-mcp
 	install -m 644 include/chutni.h $(DESTDIR)$(PREFIX)/include/chutni.h
 	install -m 644 $(LIBCHUTNI) $(DESTDIR)$(PREFIX)/lib/libchutni.a
 

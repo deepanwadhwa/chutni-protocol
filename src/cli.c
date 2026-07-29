@@ -9,13 +9,10 @@
 #include "chutni.h"
 #include "cj.h"
 
-#include <dirent.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #define CHUTNI_APP_VERSION "0.1.0"
@@ -269,184 +266,46 @@ static int cmd_roots(void) {
     return 0;
 }
 
-/* -------------------------------------------------------------------- scan */
-
-typedef struct {
-    chutni_store *store;
-    const char   *root_id;
-    char          derivation_text[CHUTNI_ID_STRLEN];
-    char          derivation_meta[CHUTNI_ID_STRLEN];
-    unsigned long seen, indexed, unchanged, text_artifacts, meta_artifacts, skipped, errors;
-    unsigned long max_bytes;
-} Scan;
-
-/* Names that are nearly always machine output rather than user documents. */
-static int excluded_name(const char *name) {
-    static const char *skip[] = {
-        ".git", ".svn", ".hg", "node_modules", ".cache", "__pycache__",
-        ".venv", "venv", "target", ".Trash", NULL
-    };
-    for (const char **p = skip; *p; p++) if (!strcmp(name, *p)) return 1;
-    return 0;
-}
-
-static int looks_texty(const char *path) {
-    const char *ext = strrchr(path, '.');
-    if (!ext) return 0;
-    static const char *exts[] = {
-        ".txt",".md",".markdown",".json",".csv",".tsv",".log",".rst",
-        ".c",".h",".cc",".cpp",".hpp",".py",".rs",".js",".ts",".go",".rb",
-        ".sh",".yaml",".yml",".toml",".ini",".html",".htm",".xml",".tex", NULL
-    };
-    for (const char **e = exts; *e; e++) if (!strcasecmp(ext, *e)) return 1;
-    return 0;
-}
-
-static void scan_file(Scan *sc, const char *path, const struct stat *st) {
-    sc->seen++;
-    if ((unsigned long)st->st_size > sc->max_bytes) { sc->skipped++; return; }
-
-    char source_id[CHUTNI_ID_STRLEN];
-    int changed = 0;
-    if (chutni_source_put(sc->store, sc->root_id, path, 1, source_id, &changed) != CHUTNI_OK) {
-        sc->errors++;
-        return;
-    }
-    sc->indexed++;
-    /* Unchanged bytes mean the existing artifacts are still current; redoing
-       extraction would only burn I/O (§4 incremental updates). */
-    if (!changed) { sc->unchanged++; return; }
-
-    char content_hash[CHUTNI_HASH_STRLEN];
-    if (chutni_hash_file(path, content_hash) != CHUTNI_OK) { sc->errors++; return; }
-
-    chutni_artifact a;
-    memset(&a, 0, sizeof a);
-    a.source_id = source_id;
-    a.source_content_hash = content_hash;
-
-    char artifact_id[CHUTNI_ID_STRLEN];
-    char *text = NULL;
-    if (looks_texty(path) && st->st_size > 0) {
-        FILE *f = fopen(path, "rb");
-        if (f) {
-            text = malloc((size_t)st->st_size + 1);
-            if (text) {
-                size_t got = fread(text, 1, (size_t)st->st_size, f);
-                text[got] = 0;
-                /* A NUL byte means this is not text, whatever the extension said. */
-                if (memchr(text, 0, got)) { free(text); text = NULL; }
-            }
-            fclose(f);
-        }
-    }
-
-    if (text) {
-        a.artifact_kind = "extracted_text";
-        a.artifact_origin = "deterministic_transform";
-        a.media_type = "text/plain; charset=utf-8";
-        a.inline_text = text;
-        a.derivation_id = sc->derivation_text;
-        if (chutni_artifact_put(sc->store, &a, artifact_id) == CHUTNI_OK) sc->text_artifacts++;
-        else sc->errors++;
-        free(text);
-    } else {
-        /* Everything else is recorded honestly as metadata. A model-backed
-           producer can add captions, OCR, or summaries later without this
-           scanner pretending it understood the file. */
-        char meta[256];
-        snprintf(meta, sizeof meta, "{\"size_bytes\":%lld}", (long long)st->st_size);
-        a.artifact_kind = "file_metadata";
-        a.artifact_origin = "direct";
-        a.media_type = "application/json";
-        a.inline_text = meta;
-        a.derivation_id = sc->derivation_meta;
-        if (chutni_artifact_put(sc->store, &a, artifact_id) == CHUTNI_OK) sc->meta_artifacts++;
-        else sc->errors++;
-    }
-}
-
-static void scan_dir(Scan *sc, const char *dir, int depth) {
-    if (depth > 64) return;
-    DIR *d = opendir(dir);
-    if (!d) { sc->errors++; return; }
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        if (e->d_name[0] == '.') continue;            /* include_hidden: false */
-        if (excluded_name(e->d_name)) continue;
-        char full[PATH_MAX];
-        if ((size_t)snprintf(full, sizeof full, "%s/%s", dir, e->d_name) >= sizeof full) continue;
-        struct stat st;
-        if (lstat(full, &st) != 0) { sc->errors++; continue; }
-        if (S_ISLNK(st.st_mode)) continue;            /* follow_symlinks: false */
-        if (S_ISDIR(st.st_mode)) scan_dir(sc, full, depth + 1);
-        else if (S_ISREG(st.st_mode)) scan_file(sc, full, &st);
-    }
-    closedir(d);
-}
-
 static int cmd_scan(void) {
     chutni_store *s = open_store(0);
-
-    Scan sc;
-    memset(&sc, 0, sizeof sc);
-    sc.store = s;
-    sc.max_bytes = 64ul * 1024 * 1024;
-
-    char producer_id[CHUTNI_ID_STRLEN];
-    chutni_producer p;
-    memset(&p, 0, sizeof p);
-    p.producer_kind = "parser";
-    p.name = "chutni-reference-scanner";
-    p.version = CHUTNI_APP_VERSION;
-    p.app_name = "chutni";
-    p.app_version = CHUTNI_APP_VERSION;
-    if (chutni_producer_put(s, &p, producer_id) != CHUTNI_OK)
-        die("cannot record producer", CHUTNI_ERR_DB, s);
-    if (chutni_derivation_put(s, producer_id, "extract_text", NULL,
-                              "{\"strategy\":\"whole_file_utf8\"}", "[]",
-                              sc.derivation_text) != CHUTNI_OK)
-        die("cannot record derivation", CHUTNI_ERR_DB, s);
-    if (chutni_derivation_put(s, producer_id, "record_file_metadata", NULL,
-                              "{\"fields\":[\"size_bytes\"]}", "[]",
-                              sc.derivation_meta) != CHUTNI_OK)
-        die("cannot record derivation", CHUTNI_ERR_DB, s);
-
-    /* Roots come from the catalog, never the command line: a producer MUST NOT
-       index outside authorized roots (§11). */
-    chutni_root_info *roots = NULL;
-    size_t nroots = 0;
-    chutni_roots_list(s, &roots, &nroots);
-    if (nroots == 0) {
-        fprintf(stderr, "chutni: no authorized roots. Add one with:  chutni add-root <dir>\n");
+    chutni_scan_options options;
+    memset(&options, 0, sizeof options);
+    options.app_name = "chutni";
+    options.app_version = CHUTNI_APP_VERSION;
+    chutni_scan_result result;
+    chutni_status status = chutni_scan(s, &options, &result);
+    if (status != CHUTNI_OK) {
         chutni_close(s);
-        return 1;
+        die("scan failed", status, NULL);
     }
-    for (size_t i = 0; i < nroots; i++) {
-        if (!roots[i].path) continue;
-        sc.root_id = roots[i].root_id;
-        scan_dir(&sc, roots[i].path, 0);
-    }
-    chutni_root_info_free(roots, nroots);
 
     if (opt_json) {
         cj *root = cj_obj();
-        cj_set(root, "files_seen", cj_num((double)sc.seen));
-        cj_set(root, "sources_indexed", cj_num((double)sc.indexed));
-        cj_set(root, "unchanged", cj_num((double)sc.unchanged));
-        cj_set(root, "text_artifacts", cj_num((double)sc.text_artifacts));
-        cj_set(root, "metadata_artifacts", cj_num((double)sc.meta_artifacts));
-        cj_set(root, "skipped", cj_num((double)sc.skipped));
-        cj_set(root, "errors", cj_num((double)sc.errors));
+        cj_set(root, "files_seen", cj_num((double)result.files_seen));
+        cj_set(root, "sources_indexed", cj_num((double)result.sources_indexed));
+        cj_set(root, "unchanged", cj_num((double)result.unchanged));
+        cj_set(root, "text_artifacts", cj_num((double)result.text_artifacts));
+        cj_set(root, "metadata_artifacts",
+               cj_num((double)result.metadata_artifacts));
+        cj_set(root, "skipped", cj_num((double)result.skipped));
+        cj_set(root, "errors", cj_num((double)result.errors));
         print_json(root);
     } else {
-        printf("Scanned %lu files\n", sc.seen);
-        printf("  sources indexed     %lu  (%lu already current)\n", sc.indexed, sc.unchanged);
-        printf("  text artifacts      %lu\n", sc.text_artifacts);
-        printf("  metadata artifacts  %lu\n", sc.meta_artifacts);
-        if (sc.skipped) printf("  skipped (too large) %lu\n", sc.skipped);
-        if (sc.errors)  printf("  errors              %lu\n", sc.errors);
+        printf("Scanned %llu files\n",
+               (unsigned long long)result.files_seen);
+        printf("  sources indexed     %llu  (%llu already current)\n",
+               (unsigned long long)result.sources_indexed,
+               (unsigned long long)result.unchanged);
+        printf("  text artifacts      %llu\n",
+               (unsigned long long)result.text_artifacts);
+        printf("  metadata artifacts  %llu\n",
+               (unsigned long long)result.metadata_artifacts);
+        if (result.skipped)
+            printf("  skipped (too large) %llu\n",
+                   (unsigned long long)result.skipped);
+        if (result.errors)
+            printf("  errors              %llu\n",
+                   (unsigned long long)result.errors);
     }
     chutni_close(s);
     return 0;

@@ -11,10 +11,57 @@ model. Samosa is the first guinea-pig host, not a privileged implementation.
 | Host application | Finds, creates, opens, updates, searches, and validates the store; enforces permissions |
 | Language model | Suggests queries or produces derived content; never writes catalog rows directly |
 | Chutni store | Holds portable sources, artifacts, provenance, representations, and disposable indexes |
-| Optional adapter or gateway | Maps another transport, such as MCP or HTTP, onto the same Chutni operations |
+| `chutni-mcp` or another adapter | Maps MCP or a native process call onto the same Chutni operations |
 
 The host can link `libchutni`, invoke a conforming local service, or implement
 the format itself. The result on disk must be the same protocol-defined store.
+
+## Recommended integration: ship the reusable service
+
+An application can bundle the reference `chutni-mcp` executable instead of
+maintaining its own store implementation. This is packaging, not a
+Samosa-specific fork: every host calls the same tool contract and every call
+ultimately reaches `libchutni`.
+
+There are two transports:
+
+- **MCP stdio** for hosts with MCP support. Launch `chutni-mcp --stdio` (or just
+  `chutni-mcp`) and use `tools/list` / `tools/call`.
+- **One-shot JSON** for native hosts that already supervise child processes.
+  Launch `chutni-mcp --call TOOL JSON`. It invokes the same tool handler, emits
+  one JSON object on stdout, and exits nonzero when the tool reports an error.
+
+The service exposes this stable application surface:
+
+| Tool | Purpose | Writes? |
+|---|---|---|
+| `chutni_folder_status` | Classify a selected source/store and report the safe next action | no |
+| `chutni_folder_activate` | After confirmation, create/open, authorize, register, and scan | yes |
+| `chutni_discover` | Find bounded, registered/conventional stores | no |
+| `chutni_store_info` | Read identity, roots, and catalog counts | no |
+| `chutni_scan` | Rescan already-authorized roots and retire stale artifacts | yes |
+| `chutni_search` | Retrieve current bounded excerpts with paths and provenance | no |
+| `chutni_put_model_artifact` | Retain approved model output with complete derivation provenance | yes |
+
+The three write operations that scan or retain model output require an explicit
+`confirmed: true`. A host must set it only after the corresponding user action;
+the service does not treat a model tool call as permission.
+
+### What the end user does in a bundled application
+
+1. Install and open the application. There is no separate Chutni install.
+2. Choose a folder in the application's memory UI.
+3. Review the adjacent store path and scan policy returned by
+   `chutni_folder_status`.
+4. Approve **Create/Open memory**.
+5. The application invokes `chutni_folder_activate`; the folder's portable
+   sibling store appears as `Folder.chutni`.
+6. Future turns search that store, and another Chutni-capable application can
+   open the same store without migration.
+
+Applications may also support an independently installed `chutni-mcp`; this is
+useful for extensible hosts such as desktop MCP clients. It is not required for
+an application that bundles the service.
 
 ## The selected-folder contract
 
@@ -118,6 +165,11 @@ chutni_check_freshness
 
 The host remains responsible for the UI permission step and for mapping the
 selected source directory to the adjacent default store path.
+
+When using `chutni-mcp`, `chutni_folder_status` and
+`chutni_folder_activate` perform that mapping consistently. The host still owns
+the UI, the user confirmation, which store is active for a conversation, and
+what retrieved text may be disclosed to a remote model.
 
 ## What “works with Chutni” means
 

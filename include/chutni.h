@@ -235,6 +235,39 @@ void chutni_source_info_free(chutni_source_info *sources, size_t count);
 chutni_status chutni_source_find(chutni_store *store, const char *path,
                                  char source_id[CHUTNI_ID_STRLEN]);
 
+/* --------------------------------------------------------------- ingestion
+ *
+ * Reference whole-folder scanner used by the CLI and local services. It
+ * indexes only roots already authorized in the store. Text-like UTF-8 files
+ * become extracted_text artifacts; other regular files receive honest
+ * file_metadata artifacts rather than fabricated extraction.
+ */
+
+typedef struct {
+    /* Zero selects the reference scanner's 64 MiB safety cap. */
+    uint64_t max_file_size_bytes;
+    /* The host application invoking the shared scanner. */
+    const char *app_name;
+    const char *app_version;
+} chutni_scan_options;
+
+typedef struct {
+    uint64_t files_seen;
+    uint64_t sources_indexed;
+    uint64_t unchanged;
+    uint64_t text_artifacts;
+    uint64_t metadata_artifacts;
+    uint64_t skipped;
+    uint64_t errors;
+} chutni_scan_result;
+
+/* Scan every root recorded in the store, then rebuild disposable indexes.
+ * A missing root is recorded through the source APIs on later refresh; the
+ * scanner never broadens authorization beyond the catalog's roots. */
+chutni_status chutni_scan(chutni_store *store,
+                          const chutni_scan_options *options,
+                          chutni_scan_result *result);
+
 typedef struct {
     char *artifact_id;
     char *artifact_kind;

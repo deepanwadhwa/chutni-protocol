@@ -14,8 +14,9 @@ the next session from claiming a feature that was never built.
 
 All verified on macOS 15 (Darwin arm64, Apple clang 21.0.0) — **the only
 machine this has ever run on**. `make test`: 105 BLAKE3 checks, 41 conformance
-assertions, 16 CLI checks, 0 failures, 2 declared gaps. `make sanitize` re-runs
-both suites under ASan + UBSan, also clean.
+assertions, 16 CLI checks, and 24 reusable-service checks, with 0 failures and
+2 declared gaps. `make sanitize` re-runs the conformance, CLI, and service
+suites under ASan + UBSan, also clean.
 
 | Area | Spec | State |
 |---|---|---|
@@ -35,6 +36,7 @@ both suites under ASan + UBSan, also clean.
 | Brute-force cosine semantic search | §19.1 | built in C API, tested |
 | Store discovery and registry | §39 | built, tested |
 | Application Host lifecycle and cross-host handoff | §30.5, §40 | specified; reference handoff tested |
+| Reusable local service | §20, §40 | MCP stdio + native one-shot tool surface built, tested |
 | Reader + Producer + Search Provider conformance | §30.1–30.3 | believed met, not independently audited |
 
 Non-obvious properties worth preserving:
@@ -63,7 +65,7 @@ relevant §31 scenarios as `GAP`.
 | **Relations** | §18 | Table exists; nothing writes or reads it. No `duplicate_of`, `contains`, etc. |
 | **Non-text ingestion** — images, audio, spreadsheets, archives | §25.2–25.4 | Non-text files get a `file_metadata` artifact only. No OCR, captions, transcripts, or sheet inventories. |
 | **Selectors in practice** | §15.3 | Column is written and read, but nothing produces page/region/time selectors because nothing parses those formats. |
-| **Gateway and disclosure enforcement** | §27, §30.4 | The manifest records `external_disclosure_default: deny`; no code enforces it because there is no gateway. |
+| **Disclosure enforcement** | §27, §30.4 | The manifest records `external_disclosure_default: deny`; the local service never sends network traffic, but a cloud-facing host still has to enforce disclosure policy before forwarding excerpts. |
 | **Archive safety** | §28.3 | No archive extraction exists yet, so no zip-bomb or traversal defenses. Needed before §25 archive support. |
 | **Windows support** | §26 | POSIX-only: `/dev/urandom`, `lstat`, `realpath`, forward-slash paths. Never compiled on Windows. |
 | **Concurrency testing** | — | WAL is on and busy-timeout is set, but multi-process access has never been tested. |
@@ -119,15 +121,18 @@ needs a parser the project does not currently have.
 - **M4** — archives: listing only, with the §28.3 defenses in place first.
 - **M5** — conformance scenario 8, currently GAP.
 
-### Phase G — gateway and disclosure (§27, §30.4)
+### Phase G — service and disclosure (§27, §30.4)
 
 Needed before any cloud model touches a store.
 
-- **G1** — a local read-only service exposing the §20 minimum operations.
+- ~~**G1**~~ — **done 2026-07-29.** `chutni-mcp` exposes the shared host
+  lifecycle through MCP stdio and a native one-shot JSON mode. Read tools are
+  non-mutating; scan/create/retention tools require explicit confirmation.
 - **G2** — enforce the permission levels in §27.4: store, root, source,
   artifact-type, one-time, session, persistent.
 - **G3** — client authentication (§28.6) and separate authorization for
-  write-capable clients (§28.7).
+  write-capable network clients (§28.7). Stdio inherits the launching host's
+  local process boundary.
 
 ### Phase A — application adoption (§30.5, §40)
 
@@ -152,8 +157,9 @@ Samosa is the first §40 Application Host and conformance guinea pig. It has
 substantial extraction, OCR, scanning, and local-model code that a conforming
 producer can reuse; its **storage layer** is what differs.
 
-- **S1** — link `libchutni` into Samosa and implement the §40 selected-folder
-  lifecycle, so selecting `P` opens `P.chutni` or offers to create it.
+- **S1** — bundle `chutni-mcp` in Samosa and route its §40 selected-folder
+  lifecycle through the shared service, so selecting `P` opens `P.chutni` or
+  offers to create it.
 - **S2** — a Samosa producer that writes conformant artifacts, with its models
   recorded as §16.2 producers (model id, revision, quantization, runtime).
 - **S3** — decide the fate of Samosa's schema-v2 sidecar: migrate it, run both,

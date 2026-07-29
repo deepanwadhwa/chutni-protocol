@@ -45,6 +45,7 @@ Honest summary of what runs today, on one machine (macOS 15 / arm64, Apple M3).
 | Image, audio, spreadsheet ingestion (§25.2–§25.4) | **not built** |
 | Semantic search (§19.1) | built in the C API as brute-force cosine; hybrid search is not built |
 | Application Host lifecycle (§30.5, §40) | specified, documented, handoff scenario tested |
+| Reusable local service (`chutni-mcp`) | built; MCP stdio and native one-shot modes tested |
 
 `make test` reports the unbuilt conformance scenarios as GAP rather than
 counting them as passes. Verified only on macOS 15 / arm64 (Apple M3) — the
@@ -58,8 +59,8 @@ No package manager and no dependencies to install. SQLite and BLAKE3 are
 vendored and compiled from source.
 
 ```sh
-make           # builds build/chutni and build/libchutni.a
-make test      # BLAKE3 vectors, conformance suite, CLI checks
+make           # builds build/chutni, build/chutni-mcp, and build/libchutni.a
+make test      # vectors, conformance, CLI, and service lifecycle checks
 make sanitize  # both suites under ASan + UBSan
 make install   # PREFIX=/usr/local by default
 ```
@@ -85,12 +86,48 @@ chutni verify                            # re-hash sources, retire stale artifac
 
 Every command takes `--json`, because the main consumers are agents.
 
+## Use from an application
+
+Applications do not need to reimplement the catalog or teach the language model
+SQL. They can bundle and launch the same `chutni-mcp` executable:
+
+```text
+Samosa / another native app ── one-shot calls ──┐
+ChatGPT / Claude / an MCP host ── MCP stdio ────┼─ chutni-mcp ─ libchutni ─ P.chutni
+an app linking the C library ───────────────────┘
+```
+
+For MCP hosts, configure `build/chutni-mcp` as a local stdio server. It
+advertises seven tools covering folder status and activation, discovery, store
+inspection, scanning, searching, and provenance-complete model artifacts.
+
+Native applications that already supervise child processes can call the exact
+same implementation without embedding an MCP client:
+
+```sh
+build/chutni-mcp --call chutni_folder_status \
+  '{"path":"/Users/me/Research"}'
+
+# Only after the app shows the proposed Research.chutni path and the user
+# approves creating/opening it and scanning Research:
+build/chutni-mcp --call chutni_folder_activate \
+  '{"path":"/Users/me/Research","confirmed":true,"register":true,
+    "label":"Research","app_name":"example-app","app_version":"1.0"}'
+```
+
+Both modes return structured JSON and operate on the same protocol-defined
+store. `stdout` is reserved for protocol output; diagnostics use `stderr`.
+Applications normally ship this executable with their own installer, so their
+end users do not need a separate Chutni installation.
+
 ## For AI applications
 
-The application implements Chutni; the language model does not write the store
-itself. When a user selects an ordinary folder `P`, a conforming host checks for
-the adjacent `P.chutni` store. It opens and reuses that store when present, or
-offers to create it, add `P` as an authorized root, and scan it when absent.
+The application adopts Chutni—by linking the library, invoking the reusable
+service, or implementing the specification. The language model does not write
+the store itself. When a user selects an ordinary folder `P`, a conforming host
+checks for the adjacent `P.chutni` store. It opens and reuses that store when
+present, or offers to create it, add `P` as an authorized root, and scan it when
+absent.
 
 The complete host lifecycle is normative in [SPEC §40](SPEC.md), with a
 practical implementation guide in
