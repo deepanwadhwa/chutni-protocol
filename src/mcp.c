@@ -459,6 +459,7 @@ static cj *tool_search(const cj *arguments, int *is_error) {
     request.query = query;
     request.limit = limit;
     request.include_stale = argument_bool(arguments, "include_stale", 0);
+    request.match_any = argument_bool(arguments, "match_any", 0);
     chutni_search_result *results = NULL;
     size_t count = 0;
     status = chutni_search(store, &request, &results, &count);
@@ -832,6 +833,8 @@ static cj *tools_list(void) {
                schema_integer("Maximum number of results.", 1, 100));
         cj_set(properties, "include_stale",
                schema_boolean("Include stale artifacts; false by default."));
+        cj_set(properties, "match_any",
+               schema_boolean("Match any literal query term instead of requiring every term; false by default."));
         const char *required[] = {"store_path", "query", NULL};
         cj_push(tools, tool_definition(
             "chutni_search", "Search Chutni memory",

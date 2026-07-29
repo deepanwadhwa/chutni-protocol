@@ -175,6 +175,17 @@ def main():
         assert found["results"][0]["display_path"] == str(note.resolve())
         assert found["results"][0]["freshness"] == "current"
 
+        broad, failed = session.tool(
+            "chutni_search",
+            {
+                "store_path": str(store),
+                "query": "unmatched marsupials",
+                "match_any": True,
+            },
+        )
+        assert not failed
+        assert broad["count"] == 1
+
         info, failed = session.tool(
             "chutni_store_info", {"store_path": str(store)}
         )
@@ -252,7 +263,7 @@ def main():
         assert one_shot_status["action"] == "open_store"
         assert one_shot_status["store_path"] == str(store)
 
-    print("Chutni MCP checks: 24 passed, 0 failed")
+    print("Chutni MCP checks: 25 passed, 0 failed")
 
 
 if __name__ == "__main__":

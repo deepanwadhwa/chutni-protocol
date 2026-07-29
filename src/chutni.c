@@ -2137,8 +2137,8 @@ void chutni_representation_info_free(chutni_representation_info *reps, size_t co
 /* User input is treated as literal terms rather than FTS5 operator syntax: a
  * stray quote or AND in a question should not become a query error or silently
  * change the meaning of the search. */
-static char *fts_query_escape(const char *query) {
-    size_t cap = strlen(query) * 3 + 8;
+static char *fts_query_escape(const char *query, int match_any) {
+    size_t cap = strlen(query) * 4 + 8;
     char *out = malloc(cap);
     if (!out) return NULL;
     size_t len = 0;
@@ -2149,7 +2149,12 @@ static char *fts_query_escape(const char *query) {
         if (!*p) break;
         const char *start = p;
         while (*p && (unsigned char)*p > ' ') p++;
-        if (wrote_term) out[len++] = ' ';
+        if (wrote_term) {
+            const char *joiner = match_any ? " OR " : " ";
+            size_t joiner_len = strlen(joiner);
+            memcpy(out + len, joiner, joiner_len);
+            len += joiner_len;
+        }
         out[len++] = '"';
         for (const char *c = start; c < p; c++) {
             if (*c == '"') out[len++] = '"';   /* FTS5 escapes a quote by doubling */
@@ -2378,7 +2383,7 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
     if (!req->query || !*req->query) return fail(s, CHUTNI_ERR_INVALID, "empty query");
     if (!s->have_index) return fail(s, CHUTNI_ERR_NOTFOUND, "no lexical index; run rebuild-indexes");
 
-    char *fts = fts_query_escape(req->query);
+    char *fts = fts_query_escape(req->query, req->match_any);
     if (!fts) return fail(s, CHUTNI_ERR_INVALID, "query has no searchable terms");
 
     int limit = req->limit > 0 ? req->limit : 20;

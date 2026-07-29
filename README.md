@@ -100,6 +100,8 @@ an app linking the C library ─────────────────
 For MCP hosts, configure `build/chutni-mcp` as a local stdio server. It
 advertises seven tools covering folder status and activation, discovery, store
 inspection, scanning, searching, and provenance-complete model artifacts.
+Search defaults to precise all-term matching; hosts deriving queries from prose
+can request literal any-term matching without exposing FTS operator syntax.
 
 Native applications that already supervise child processes can call the exact
 same implementation without embedding an MCP client:

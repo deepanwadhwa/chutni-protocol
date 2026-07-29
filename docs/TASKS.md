@@ -14,7 +14,7 @@ the next session from claiming a feature that was never built.
 
 All verified on macOS 15 (Darwin arm64, Apple clang 21.0.0) — **the only
 machine this has ever run on**. `make test`: 105 BLAKE3 checks, 41 conformance
-assertions, 16 CLI checks, and 24 reusable-service checks, with 0 failures and
+assertions, 16 CLI checks, and 25 reusable-service checks, with 0 failures and
 2 declared gaps. `make sanitize` re-runs the conformance, CLI, and service
 suites under ASan + UBSan, also clean.
 
@@ -157,16 +157,18 @@ Samosa is the first §40 Application Host and conformance guinea pig. It has
 substantial extraction, OCR, scanning, and local-model code that a conforming
 producer can reuse; its **storage layer** is what differs.
 
-- **S1** — bundle `chutni-mcp` in Samosa and route its §40 selected-folder
-  lifecycle through the shared service, so selecting `P` opens `P.chutni` or
-  offers to create it.
+- ~~**S1**~~ — **done 2026-07-29.** Samosa pins and bundles `chutni-mcp`;
+  selecting `P` checks, creates/opens, scans, and searches the adjacent
+  `P.chutni` through the shared service.
 - **S2** — a Samosa producer that writes conformant artifacts, with its models
   recorded as §16.2 producers (model id, revision, quantization, runtime).
-- **S3** — decide the fate of Samosa's schema-v2 sidecar: migrate it, run both,
-  or retire it. This is an owner decision, not an agent one.
-- **S4** — real-store gate: Samosa reads a store built by `chutni`, and
-  `chutni` reads a store built by Samosa. Until that runs, neither is
-  described as compatible.
+- ~~**S3**~~ — **done 2026-07-29.** The Samosa gateway retired its schema-v2
+  sidecar from the live path. It keeps presentation/job metadata only; the
+  legacy source remains for standalone migration tests and is not packaged.
+- ~~**S4**~~ — **done 2026-07-29.** Samosa's gateway integration test creates
+  and queries a real adjacent store, the standalone service reads and updates
+  it, and Samosa retrieves that update and supplies bounded evidence to a
+  local-model chat turn.
 
 ### Phase W — Windows (§26)
 

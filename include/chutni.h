@@ -411,6 +411,9 @@ typedef struct {
     const char *const *media_types;     /* NULL-terminated filter, may be NULL */
     int limit;
     int include_stale;                  /* default 0: only active artifacts (§15.4) */
+    /* Default 0 preserves precise all-term matching. When true, literal terms
+     * are joined with OR; useful when a host derives a query from prose. */
+    int match_any;
 } chutni_search_request;
 
 typedef struct {
