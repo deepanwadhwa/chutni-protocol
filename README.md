@@ -182,6 +182,17 @@ producer/model/application, selector, exact source hash, and creation time.
 validates those records and their source binding; it deliberately does not
 decide whether an interpretation is true.
 
+## Implementing the format directly
+
+Most applications should embed `libchutni` or launch `chutni-mcp` rather than
+write a parser. If you're implementing against the specification instead —
+a different language, a constrained environment, or you just want to read a
+store without a dependency — start with
+**[docs/IMPLEMENTERS.md](docs/IMPLEMENTERS.md)**: the Reader contract (§30.1)
+in about fifteen rows, the three SQL queries a Reader actually needs, and the
+freshness rule worked out byte-for-byte against a real store, not summarized
+from memory.
+
 ## For AI applications
 
 The application adopts Chutni—by linking the library, invoking the reusable
