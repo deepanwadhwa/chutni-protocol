@@ -62,6 +62,7 @@ Every command accepts `--json`; agents are the primary consumers.
 |---|---|
 | `VERSION` | the implementation's release version, and the only place it is written |
 | `SPEC.md` | the protocol |
+| `docs/IMPLEMENTERS.md` | the Reader contract in ~15 rows, for anyone implementing against the format rather than using this CLI |
 | `include/chutni.h` | the stable C ABI — the contract other apps bind to |
 | `src/chutni.c` | store, catalog, objects, sources, artifacts, search, discovery |
 | `src/cj.{c,h}` | JSON document model (a DOM, not an extractor — see below) |

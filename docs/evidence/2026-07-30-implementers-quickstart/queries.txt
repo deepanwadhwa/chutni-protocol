@@ -1,0 +1,88 @@
+$ uname -sm; cc --version | head -1
+Darwin arm64
+Apple clang version 21.0.0 (clang-2100.1.1.101)
+
+Fixture: two-file, one-subdirectory tree under Notes/, scanned bounded.
+
+$ chutni init Memory.chutni
+Created /private/tmp/claude-501/-Users-deepanwadhwa-Documents-chutni-protocol/3417ca45-568f-4bb7-b3c9-eb52b99f425f/scratchpad/t06b/Memory.chutni
+  store_id 019fb397-0eaf-7210-995a-5ead67135fe3
+Registered so other applications can discover it.
+
+$ chutni add-root Notes --max-depth 1 --goal define --definition-mode adaptive
+Authorized /private/tmp/claude-501/-Users-deepanwadhwa-Documents-chutni-protocol/3417ca45-568f-4bb7-b3c9-eb52b99f425f/scratchpad/t06b/Notes
+  root_id 019fb397-0eb4-777d-8332-e2efdf29b128
+  max_depth 1 — directories deeper than this are recorded by name and not opened
+
+$ chutni scan
+Observed 2 directories and 2 files
+  directories enumerated  2  (deepest depth 1)
+  sources indexed         2  (0 already current)
+  listings                2 written, 0 reused
+  text artifacts          2
+  metadata artifacts      2
+  complete for policy     yes
+
+================ Query 1: sources under a root (raw, unedited paths) ================
+source_id                             source_kind  display_path                                                                                                                                        parent_source_id                      state  
+------------------------------------  -----------  --------------------------------------------------------------------------------------------------------------------------------------------------  ------------------------------------  -------
+019fb397-0eb8-7123-b50c-860203877f8a  directory    /private/tmp/claude-501/-Users-deepanwadhwa-Documents-chutni-protocol/3417ca45-568f-4bb7-b3c9-eb52b99f425f/scratchpad/t06b/Notes                    (root)                                present
+019fb397-0eb8-7e59-a692-a8cebaf8f4fc  directory    /private/tmp/claude-501/-Users-deepanwadhwa-Documents-chutni-protocol/3417ca45-568f-4bb7-b3c9-eb52b99f425f/scratchpad/t06b/Notes/Projects           019fb397-0eb8-7123-b50c-860203877f8a  present
+019fb397-0eb8-718d-8006-ced421991e62  file         /private/tmp/claude-501/-Users-deepanwadhwa-Documents-chutni-protocol/3417ca45-568f-4bb7-b3c9-eb52b99f425f/scratchpad/t06b/Notes/Projects/retro.md  019fb397-0eb8-7e59-a692-a8cebaf8f4fc  present
+019fb397-0eb9-7980-8419-c9421b6a1349  file         /private/tmp/claude-501/-Users-deepanwadhwa-Documents-chutni-protocol/3417ca45-568f-4bb7-b3c9-eb52b99f425f/scratchpad/t06b/Notes/parb.md            019fb397-0eb8-7123-b50c-860203877f8a  present
+
+================ Query 2: active artifacts for Notes/parb.md ================
+artifact_id                           artifact_kind   artifact_origin          status  producer_kind  producer_name           
+------------------------------------  --------------  -----------------------  ------  -------------  ------------------------
+019fb397-0eba-745c-a1d4-0555ae1d836d  extracted_text  deterministic_transform  active  parser         chutni-reference-scanner
+019fb397-0eba-7a18-ba92-7199ff8a2096  file_metadata   direct                   active  parser         chutni-reference-scanner
+
+================ Query 3: latest coverage manifest, raw row + resolved object ================
+artifact_id                           object_hash                                                              created_at          
+------------------------------------  -----------------------------------------------------------------------  --------------------
+019fb397-0ebb-799e-8824-df733cbcfddf  blake3:fe836b93a4b969574006b79b80b7efcd03fe48e6b9ca20ced91d7e05968233a9  2026-07-30T15:14:09Z
+
+object relative_path: objects/blake3/fe/83/fe836b93a4b969574006b79b80b7efcd03fe48e6b9ca20ced91d7e05968233a9
+{
+    "scan_generation": "019fb397-0eba-7111-a45a-23a72388273a",
+    "root_source_id": "019fb397-0eb8-7123-b50c-860203877f8a",
+    "policy": {
+        "max_depth": 1,
+        "recursive": true,
+        "follow_symlinks": false,
+        "include_hidden": false,
+        "memory_goal": "define",
+        "definition_mode": "adaptive"
+    },
+    "coverage": {
+        "deepest_directory_enumerated": 1,
+        "directories_observed": 2,
+        "directories_enumerated": 2,
+        "directories_defined": 0,
+        "directories_collapsed": 0,
+        "files_observed": 2,
+        "files_hashed": 2,
+        "files_read": 2,
+        "files_defined": 0,
+        "depth_limited_directories": 0,
+        "excluded_sources": 0,
+        "unsupported_sources": 0,
+        "sources_marked_missing": 0,
+        "errors": 0
+    },
+    "complete_for_policy": true
+}
+
+================ hand-verification of the directory listing hash ================
+stored content_hash for Notes:
+blake3:004dbf35e6c1903c31294a7b7a4e23ca9ee9576dad1b85a0d3d728ed690a598f
+
+immediate entries, sorted by raw name bytes:
+Projects
+parb.md
+
+serialization: chutni-listing-1
+Projects	directory
+parb.md	file
+
+computed via chutni_hash_bytes() over that exact serialization: blake3:004dbf35e6c1903c31294a7b7a4e23ca9ee9576dad1b85a0d3d728ed690a598f
