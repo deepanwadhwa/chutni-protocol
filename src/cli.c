@@ -15,7 +15,15 @@
 #include <string.h>
 #include <unistd.h>
 
-#define CHUTNI_APP_VERSION "0.1.0"
+/* The implementation's release version comes from the VERSION file via the
+ * Makefile. The fallback keeps a hand-rolled compile working without it, and says
+ * plainly that it does not know the version rather than naming one it cannot
+ * vouch for — this string ends up in producer records (§16.1). */
+#ifndef CHUTNI_VERSION
+#define CHUTNI_VERSION "0.0.0-unversioned"
+#endif
+
+#define CHUTNI_APP_VERSION CHUTNI_VERSION
 
 static int  opt_json = 0;
 static int  opt_limit = 20;
@@ -23,6 +31,10 @@ static const char *opt_store = NULL;
 static const char *opt_label = NULL;
 static const char *opt_mode = "catalog_only";
 static const char *opt_kind = NULL;
+static int  opt_max_depth = CHUTNI_DEPTH_UNBOUNDED;
+static int  opt_have_max_depth = 0;
+static const char *opt_goal = NULL;
+static const char *opt_definition_mode = NULL;
 
 static int usage(void) {
     fprintf(stderr,
@@ -38,20 +50,26 @@ static int usage(void) {
 "\n"
 "building\n"
 "  init <path> [--label L]      create a store\n"
-"  add-root <dir> [--label L]   authorize a directory for indexing\n"
-"  roots                        list authorized roots\n"
-"  scan                         index authorized roots\n"
+"  add-root <dir> [--label L] [--max-depth N] [--goal G] [--definition-mode M]\n"
+"                               authorize a directory for indexing\n"
+"  roots                        list authorized roots and their policies\n"
+"  scan [--max-depth N]         index authorized roots\n"
+"  observe <dir-id|path>        enumerate exactly one directory, no recursion\n"
 "  rebuild-indexes              rebuild everything under indexes/\n"
 "\n"
 "using\n"
 "  search <query> [--limit N] [--kind K]\n"
 "  inspect <source-id|path>     show a source, its artifacts, and provenance\n"
-"  verify [<source-id|path>]    re-hash sources and report freshness\n"
+"  children <dir-id|path>       list a directory source's immediate children\n"
+"  coverage [<id|path>]         what a scan reached, and what it did not\n"
+"  verify [<source-id|path>]    re-observe sources and report freshness\n"
 "  forget <source-id> [--mode catalog_only|artifacts|secure_logical_delete|purge]\n"
 "\n"
 "options\n"
 "  --store <path>   store to operate on; defaults to $CHUTNI_STORE, or the\n"
 "                   only store discovery finds\n"
+"  --max-depth N    the selected root is depth 0; a directory at depth d is\n"
+"                   enumerated only when d <= N. Omitted means unbounded.\n"
 "  --json           machine-readable output\n"
 "\n", CHUTNI_APP_VERSION, CHUTNI_SPEC_VERSION);
     return 2;
@@ -181,6 +199,12 @@ static int cmd_info(void) {
         cj *counts = cj_obj();
         cj_set(counts, "roots", cj_num((double)c.roots));
         cj_set(counts, "sources", cj_num((double)c.sources));
+        cj_set(counts, "sources_files", cj_num((double)c.sources_files));
+        cj_set(counts, "sources_directories",
+               cj_num((double)c.sources_directories));
+        cj_set(counts, "sources_opaque_directories",
+               cj_num((double)c.sources_opaque_directories));
+        cj_set(counts, "relations", cj_num((double)c.relations));
         cj_set(counts, "artifacts", cj_num((double)c.artifacts));
         cj_set(counts, "artifacts_active", cj_num((double)c.artifacts_active));
         cj_set(counts, "artifacts_stale", cj_num((double)c.artifacts_stale));
@@ -206,7 +230,12 @@ static int cmd_info(void) {
         printf("  roots        %lld\n", (long long)c.roots);
         for (size_t i = 0; i < nroots; i++)
             printf("               %s\n", roots[i].path ? roots[i].path : "(unknown)");
-        printf("  sources      %lld\n", (long long)c.sources);
+        printf("  sources      %lld  (%lld files, %lld directories",
+               (long long)c.sources, (long long)c.sources_files,
+               (long long)c.sources_directories);
+        if (c.sources_opaque_directories)
+            printf(", %lld never opened", (long long)c.sources_opaque_directories);
+        printf(")\n");
         printf("  artifacts    %lld  (%lld active, %lld stale, %lld superseded)\n",
                (long long)c.artifacts, (long long)c.artifacts_active,
                (long long)c.artifacts_stale, (long long)c.artifacts_superseded);
@@ -225,16 +254,32 @@ static int cmd_info(void) {
 static int cmd_add_root(const char *dir) {
     if (!dir) { fprintf(stderr, "chutni: add-root needs a directory\n"); return 2; }
     chutni_store *s = open_store(0);
+    chutni_root_policy policy;
+    chutni_root_policy_defaults(&policy);
+    if (opt_have_max_depth) policy.max_depth = opt_max_depth;
+    policy.memory_goal = opt_goal;
+    policy.definition_mode = opt_definition_mode;
     char root_id[CHUTNI_ID_STRLEN];
-    chutni_status st = chutni_root_add(s, dir, opt_label, NULL, root_id);
+    chutni_status st = chutni_root_add(s, dir, opt_label, &policy, root_id);
     if (st != CHUTNI_OK) die("cannot add root", st, s);
     if (opt_json) {
         cj *root = cj_obj();
         cj_set(root, "root_id", cj_str(root_id));
         cj_set(root, "path", cj_str(dir));
+        cj_set(root, "max_depth", policy.max_depth < 0
+                                      ? cj_null()
+                                      : cj_num((double)policy.max_depth));
+        if (policy.memory_goal) cj_set(root, "memory_goal", cj_str(policy.memory_goal));
+        if (policy.definition_mode)
+            cj_set(root, "definition_mode", cj_str(policy.definition_mode));
         print_json(root);
     } else {
         printf("Authorized %s\n  root_id %s\n", dir, root_id);
+        if (policy.max_depth < 0)
+            printf("  max_depth unbounded — the whole subtree is in scope\n");
+        else
+            printf("  max_depth %d — directories deeper than this are recorded "
+                   "by name and not opened\n", policy.max_depth);
     }
     chutni_close(s);
     return 0;
@@ -252,61 +297,124 @@ static int cmd_roots(void) {
             set_opt_str(o, "root_id", roots[i].root_id);
             set_opt_str(o, "path", roots[i].path);
             if (roots[i].label) cj_set(o, "label", cj_str(roots[i].label));
+            cj *policy = roots[i].policy_json
+                             ? cj_parse(roots[i].policy_json, NULL) : NULL;
+            cj_set(o, "policy", policy ? policy : cj_null());
             cj_push(arr, o);
         }
         cj *root = cj_obj();
         cj_set(root, "roots", arr);
         print_json(root);
     } else {
-        for (size_t i = 0; i < n; i++)
-            printf("%s  %s\n", roots[i].root_id, roots[i].path ? roots[i].path : "");
+        for (size_t i = 0; i < n; i++) {
+            cj *policy = roots[i].policy_json
+                             ? cj_parse(roots[i].policy_json, NULL) : NULL;
+            cj *depth = policy ? cj_get(policy, "max_depth") : NULL;
+            printf("%s  %s", roots[i].root_id, roots[i].path ? roots[i].path : "");
+            if (depth && depth->type == CJ_NUM) printf("  max_depth %d", (int)depth->num);
+            else printf("  max_depth unbounded");
+            printf("\n");
+            cj_free(policy);
+        }
     }
     chutni_root_info_free(roots, n);
     chutni_close(s);
     return 0;
 }
 
+/* Files and directories are reported apart, and depth-limited directories are
+ * named as such, because "scanned 63 files" invites the reader to assume the
+ * whole tree was opened when it may have been one level of it. */
+static void print_scan_result(const chutni_scan_result *result) {
+    if (opt_json) {
+        cj *root = cj_obj();
+        cj_set(root, "files_seen", cj_num((double)result->files_seen));
+        cj_set(root, "sources_indexed", cj_num((double)result->sources_indexed));
+        cj_set(root, "unchanged", cj_num((double)result->unchanged));
+        cj_set(root, "text_artifacts", cj_num((double)result->text_artifacts));
+        cj_set(root, "metadata_artifacts",
+               cj_num((double)result->metadata_artifacts));
+        cj_set(root, "skipped", cj_num((double)result->skipped));
+        cj_set(root, "errors", cj_num((double)result->errors));
+        cj_set(root, "directories_observed",
+               cj_num((double)result->directories_observed));
+        cj_set(root, "directories_enumerated",
+               cj_num((double)result->directories_enumerated));
+        cj_set(root, "depth_limited_directories",
+               cj_num((double)result->depth_limited_directories));
+        cj_set(root, "listing_artifacts",
+               cj_num((double)result->listing_artifacts));
+        cj_set(root, "listings_reused", cj_num((double)result->listings_reused));
+        cj_set(root, "files_hashed", cj_num((double)result->files_hashed));
+        cj_set(root, "files_read", cj_num((double)result->files_read));
+        cj_set(root, "excluded_sources",
+               cj_num((double)result->excluded_sources));
+        cj_set(root, "unsupported_sources",
+               cj_num((double)result->unsupported_sources));
+        cj_set(root, "sources_marked_missing",
+               cj_num((double)result->sources_marked_missing));
+        cj_set(root, "deepest_directory_enumerated",
+               cj_num((double)result->deepest_directory_enumerated));
+        cj_set(root, "complete_for_policy", cj_bool(result->complete_for_policy));
+        print_json(root);
+        return;
+    }
+    printf("Observed %llu directories and %llu files\n",
+           (unsigned long long)result->directories_observed,
+           (unsigned long long)result->files_seen);
+    printf("  directories enumerated  %llu  (deepest depth %d)\n",
+           (unsigned long long)result->directories_enumerated,
+           result->deepest_directory_enumerated);
+    if (result->depth_limited_directories)
+        printf("  recorded but not opened %llu  (past max_depth)\n",
+               (unsigned long long)result->depth_limited_directories);
+    printf("  sources indexed         %llu  (%llu already current)\n",
+           (unsigned long long)result->sources_indexed,
+           (unsigned long long)result->unchanged);
+    printf("  listings                %llu written, %llu reused\n",
+           (unsigned long long)result->listing_artifacts,
+           (unsigned long long)result->listings_reused);
+    printf("  text artifacts          %llu\n",
+           (unsigned long long)result->text_artifacts);
+    printf("  metadata artifacts      %llu\n",
+           (unsigned long long)result->metadata_artifacts);
+    if (result->skipped)
+        printf("  skipped (too large)     %llu\n",
+               (unsigned long long)result->skipped);
+    if (result->sources_marked_missing)
+        printf("  marked missing          %llu  (inside the covered region only)\n",
+               (unsigned long long)result->sources_marked_missing);
+    if (result->errors)
+        printf("  errors                  %llu\n",
+               (unsigned long long)result->errors);
+    printf("  complete for policy     %s\n",
+           result->complete_for_policy ? "yes" : "no");
+    if (result->depth_limited_directories)
+        printf("\nThis is complete for the policy requested, not a complete "
+               "reading of the subtree.\n");
+}
+
+static void fill_scan_options(chutni_scan_options *options) {
+    memset(options, 0, sizeof *options);
+    options->app_name = "chutni";
+    options->app_version = CHUTNI_APP_VERSION;
+    if (opt_have_max_depth) {
+        options->use_override_max_depth = 1;
+        options->override_max_depth = opt_max_depth;
+    }
+}
+
 static int cmd_scan(void) {
     chutni_store *s = open_store(0);
     chutni_scan_options options;
-    memset(&options, 0, sizeof options);
-    options.app_name = "chutni";
-    options.app_version = CHUTNI_APP_VERSION;
+    fill_scan_options(&options);
     chutni_scan_result result;
     chutni_status status = chutni_scan(s, &options, &result);
     if (status != CHUTNI_OK) {
         chutni_close(s);
         die("scan failed", status, NULL);
     }
-
-    if (opt_json) {
-        cj *root = cj_obj();
-        cj_set(root, "files_seen", cj_num((double)result.files_seen));
-        cj_set(root, "sources_indexed", cj_num((double)result.sources_indexed));
-        cj_set(root, "unchanged", cj_num((double)result.unchanged));
-        cj_set(root, "text_artifacts", cj_num((double)result.text_artifacts));
-        cj_set(root, "metadata_artifacts",
-               cj_num((double)result.metadata_artifacts));
-        cj_set(root, "skipped", cj_num((double)result.skipped));
-        cj_set(root, "errors", cj_num((double)result.errors));
-        print_json(root);
-    } else {
-        printf("Scanned %llu files\n",
-               (unsigned long long)result.files_seen);
-        printf("  sources indexed     %llu  (%llu already current)\n",
-               (unsigned long long)result.sources_indexed,
-               (unsigned long long)result.unchanged);
-        printf("  text artifacts      %llu\n",
-               (unsigned long long)result.text_artifacts);
-        printf("  metadata artifacts  %llu\n",
-               (unsigned long long)result.metadata_artifacts);
-        if (result.skipped)
-            printf("  skipped (too large) %llu\n",
-                   (unsigned long long)result.skipped);
-        if (result.errors)
-            printf("  errors              %llu\n",
-                   (unsigned long long)result.errors);
-    }
+    print_scan_result(&result);
     chutni_close(s);
     return 0;
 }
@@ -344,6 +452,13 @@ static int cmd_search(const char *query) {
             set_opt_str(o, "score_type", res[i].score_type);
             set_opt_str(o, "freshness", res[i].freshness);
             if (res[i].producer_id) cj_set(o, "producer_id", cj_str(res[i].producer_id));
+            /* §19.3: what kind of thing matched, where it sits, and which
+               coverage manifest governs the region it came from. */
+            set_opt_str(o, "source_kind", res[i].source_kind);
+            set_opt_str(o, "parent_source_id", res[i].parent_source_id);
+            set_opt_str(o, "coverage_manifest_id", res[i].coverage_manifest_id);
+            cj_set(o, "depth", res[i].depth < 0 ? cj_null()
+                                                : cj_num((double)res[i].depth));
             cj_push(arr, o);
         }
         cj_set(root, "results", arr);
@@ -525,6 +640,153 @@ static int cmd_verify(const char *arg) {
     return exit_code;
 }
 
+/* --------------------------------------------------- hierarchy and coverage */
+
+static int cmd_children(const char *arg) {
+    if (!arg) { fprintf(stderr, "chutni: children needs a directory id or path\n"); return 2; }
+    chutni_store *s = open_store(1);
+    char source_id[CHUTNI_ID_STRLEN];
+    if (!resolve_source(s, arg, source_id)) {
+        fprintf(stderr, "chutni: no source matching %s\n", arg);
+        chutni_close(s);
+        return 1;
+    }
+    chutni_source_info *kids = NULL;
+    size_t n = 0;
+    chutni_status st = chutni_list_children(s, source_id, &kids, &n);
+    if (st != CHUTNI_OK) die("cannot list children", st, s);
+
+    if (opt_json) {
+        cj *root = cj_obj();
+        cj_set(root, "source_id", cj_str(source_id));
+        cj_set(root, "count", cj_num((double)n));
+        cj *arr = cj_arr();
+        for (size_t i = 0; i < n; i++) {
+            cj *o = cj_obj();
+            set_opt_str(o, "source_id", kids[i].source_id);
+            set_opt_str(o, "display_path", kids[i].display_path);
+            set_opt_str(o, "source_kind", kids[i].source_kind);
+            set_opt_str(o, "state", kids[i].state);
+            if (kids[i].observation)
+                cj_set(o, "observation", cj_str(kids[i].observation));
+            cj_set(o, "depth", kids[i].depth < 0 ? cj_null()
+                                                 : cj_num((double)kids[i].depth));
+            cj_push(arr, o);
+        }
+        cj_set(root, "children", arr);
+        print_json(root);
+    } else if (n == 0) {
+        printf("No children recorded. This directory may never have been "
+               "enumerated; try:  chutni observe %s\n", arg);
+    } else {
+        for (size_t i = 0; i < n; i++)
+            printf("%-9s %-10s %s\n",
+                   kids[i].source_kind ? kids[i].source_kind : "?",
+                   kids[i].observation ? kids[i].observation :
+                       (kids[i].state ? kids[i].state : ""),
+                   kids[i].display_path ? kids[i].display_path : "");
+    }
+    chutni_source_info_free(kids, n);
+    chutni_close(s);
+    return 0;
+}
+
+static int cmd_observe(const char *arg) {
+    if (!arg) { fprintf(stderr, "chutni: observe needs a directory id or path\n"); return 2; }
+    chutni_store *s = open_store(0);
+    char source_id[CHUTNI_ID_STRLEN];
+    if (!resolve_source(s, arg, source_id)) {
+        fprintf(stderr, "chutni: no source matching %s. Authorize it with "
+                        "add-root, or scan its parent first.\n", arg);
+        chutni_close(s);
+        return 1;
+    }
+    chutni_scan_options options;
+    fill_scan_options(&options);
+    chutni_scan_result result;
+    chutni_status st = chutni_observe_directory(s, source_id, &options, &result);
+    if (st != CHUTNI_OK) die("cannot observe directory", st, s);
+    print_scan_result(&result);
+    chutni_close(s);
+    return 0;
+}
+
+static int cmd_coverage(const char *arg) {
+    chutni_store *s = open_store(1);
+    char target[CHUTNI_ID_STRLEN];
+    if (arg) {
+        if (!resolve_source(s, arg, target)) {
+            fprintf(stderr, "chutni: no source matching %s\n", arg);
+            chutni_close(s);
+            return 1;
+        }
+    } else {
+        chutni_root_info *roots = NULL;
+        size_t n = 0;
+        chutni_roots_list(s, &roots, &n);
+        if (n != 1) {
+            fprintf(stderr, "chutni: %zu roots; name one with "
+                            "coverage <root-id|path>\n", n);
+            chutni_root_info_free(roots, n);
+            chutni_close(s);
+            return 1;
+        }
+        snprintf(target, sizeof target, "%s", roots[0].root_id);
+        chutni_root_info_free(roots, n);
+    }
+
+    char *json = NULL;
+    chutni_status st = chutni_get_coverage(s, target, &json);
+    if (st != CHUTNI_OK) die("cannot read coverage", st, s);
+    if (opt_json) {
+        printf("%s\n", json);
+    } else {
+        cj *parsed = cj_parse(json, NULL);
+        cj *manifest = cj_get(parsed, "coverage_manifest");
+        if (!manifest || manifest->type != CJ_OBJ) {
+            /* §35.1: no manifest is not the same as nothing covered, and a
+               consumer must not read one as the other. */
+            printf("No coverage manifest for this region.\n");
+            printf("Nothing here says how much of the tree was inspected, so "
+                   "do not assume it was all of it.\n");
+        } else {
+            cj *coverage = cj_get(manifest, "coverage");
+            cj *policy = cj_get(manifest, "policy");
+            cj *complete = cj_get(manifest, "complete_for_policy");
+            const char *depth = "unbounded";
+            char depth_buf[32];
+            cj *md = policy ? cj_get(policy, "max_depth") : NULL;
+            if (md && md->type == CJ_NUM) {
+                snprintf(depth_buf, sizeof depth_buf, "%d", (int)md->num);
+                depth = depth_buf;
+            }
+            printf("scan_generation  %s\n",
+                   cj_get_str(manifest, "scan_generation"));
+            printf("max_depth        %s\n", depth);
+            if (policy && cj_get_str(policy, "memory_goal"))
+                printf("memory_goal      %s\n", cj_get_str(policy, "memory_goal"));
+            if (policy && cj_get_str(policy, "definition_mode"))
+                printf("definition_mode  %s\n",
+                       cj_get_str(policy, "definition_mode"));
+            printf("\n");
+            if (coverage && coverage->type == CJ_OBJ)
+                for (size_t i = 0; i < coverage->n; i++)
+                    if (coverage->items[i]->type == CJ_NUM)
+                        printf("  %-30s %d\n", coverage->keys[i],
+                               (int)coverage->items[i]->num);
+            printf("\ncomplete_for_policy  %s\n",
+                   complete && complete->type == CJ_BOOL && complete->bval
+                       ? "yes" : "no");
+            printf("\nComplete for policy means the requested bounded operation "
+                   "finished.\nIt does not mean the whole subtree was read.\n");
+        }
+        cj_free(parsed);
+    }
+    free(json);
+    chutni_close(s);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ forget */
 
 static int cmd_forget(const char *arg) {
@@ -577,6 +839,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) opt_mode = argv[++i];
         else if (!strcmp(argv[i], "--kind") && i + 1 < argc) opt_kind = argv[++i];
         else if (!strcmp(argv[i], "--limit") && i + 1 < argc) opt_limit = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--goal") && i + 1 < argc) opt_goal = argv[++i];
+        else if (!strcmp(argv[i], "--definition-mode") && i + 1 < argc)
+            opt_definition_mode = argv[++i];
+        else if (!strcmp(argv[i], "--max-depth") && i + 1 < argc) {
+            opt_max_depth = atoi(argv[++i]);
+            opt_have_max_depth = 1;
+            if (opt_max_depth < 0) {
+                fprintf(stderr, "chutni: --max-depth must be 0 or more; omit it "
+                                "for unbounded recursion\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) return usage();
         else if (argv[i][0] == '-' && argv[i][1] == '-') {
             fprintf(stderr, "chutni: unknown option %s\n", argv[i]);
@@ -595,6 +869,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "inspect"))    return cmd_inspect(pos);
     if (!strcmp(cmd, "verify"))     return cmd_verify(pos);
     if (!strcmp(cmd, "forget"))     return cmd_forget(pos);
+    if (!strcmp(cmd, "children"))   return cmd_children(pos);
+    if (!strcmp(cmd, "observe"))    return cmd_observe(pos);
+    if (!strcmp(cmd, "coverage"))   return cmd_coverage(pos);
     if (!strcmp(cmd, "register")) {
         if (!pos) { fprintf(stderr, "chutni: register needs a path\n"); return 2; }
         chutni_status st = chutni_registry_add(pos);

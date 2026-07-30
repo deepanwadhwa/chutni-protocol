@@ -1001,10 +1001,533 @@ static void scenario_application_handoff(void) {
     chutni_close(host_a);
 }
 
+/* ---------------------------------------------------- v0.2 bounded coverage */
+
+static void make_dir(const char *path) { mkdir(path, 0700); }
+
+/* The fixture every hierarchy scenario walks:
+ *
+ *   tree/            depth 0
+ *     top.md         depth 1
+ *     Alpha/         depth 1
+ *       a.md         depth 2
+ *       Deep/        depth 2
+ *         d.md       depth 3
+ *     Beta/          depth 1
+ *       b.md         depth 2
+ */
+static void build_tree(const char *base) {
+    char path[700];
+    make_dir(base);
+    snprintf(path, sizeof path, "%s/Alpha", base);       make_dir(path);
+    snprintf(path, sizeof path, "%s/Alpha/Deep", base);  make_dir(path);
+    snprintf(path, sizeof path, "%s/Beta", base);        make_dir(path);
+    snprintf(path, sizeof path, "%s/top.md", base);
+    write_file(path, "Top level notes on condensation force.\n");
+    snprintf(path, sizeof path, "%s/Alpha/a.md", base);
+    write_file(path, "Alpha holds notes about arctic terns.\n");
+    snprintf(path, sizeof path, "%s/Alpha/Deep/d.md", base);
+    write_file(path, "Deep notes about cephalopod chromatophores.\n");
+    snprintf(path, sizeof path, "%s/Beta/b.md", base);
+    write_file(path, "Beta holds notes about marsupial pouches.\n");
+}
+
+/* Locate a source by path, reporting what the catalog says about it. */
+static int find_source(chutni_store *store, const char *path,
+                       char id_out[CHUTNI_ID_STRLEN],
+                       char hash_out[CHUTNI_HASH_STRLEN],
+                       char kind_out[32], char observation_out[32],
+                       char state_out[32], int *depth_out) {
+    chutni_source_info *sources = NULL;
+    size_t count = 0;
+    if (chutni_sources_list(store, NULL, &sources, &count) != CHUTNI_OK) return 0;
+    int found = 0;
+    for (size_t i = 0; i < count && !found; i++) {
+        if (!sources[i].display_path || strcmp(sources[i].display_path, path))
+            continue;
+        found = 1;
+        if (id_out) snprintf(id_out, CHUTNI_ID_STRLEN, "%s", sources[i].source_id);
+        if (hash_out) snprintf(hash_out, CHUTNI_HASH_STRLEN, "%s",
+                               sources[i].content_hash ? sources[i].content_hash : "");
+        if (kind_out) snprintf(kind_out, 32, "%s",
+                               sources[i].source_kind ? sources[i].source_kind : "");
+        if (observation_out) snprintf(observation_out, 32, "%s",
+                                      sources[i].observation ? sources[i].observation : "");
+        if (state_out) snprintf(state_out, 32, "%s",
+                                sources[i].state ? sources[i].state : "");
+        if (depth_out) *depth_out = sources[i].depth;
+    }
+    chutni_source_info_free(sources, count);
+    return found;
+}
+
+static int source_exists(chutni_store *store, const char *path) {
+    return find_source(store, path, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+/* Create a store whose single root is `tree` with the given depth bound. */
+static chutni_store *bounded_store(const char *store_path, const char *tree,
+                                   int max_depth, chutni_scan_result *result) {
+    chutni_store *store = NULL;
+    if (chutni_create(store_path, "bounded", &store) != CHUTNI_OK) return NULL;
+    chutni_root_policy policy;
+    chutni_root_policy_defaults(&policy);
+    policy.max_depth = max_depth;
+    policy.memory_goal = "define";
+    policy.definition_mode = CHUTNI_DEFINITION_ADAPTIVE;
+    char root_id[CHUTNI_ID_STRLEN];
+    if (chutni_root_add(store, tree, "tree", &policy, root_id) != CHUTNI_OK) {
+        chutni_close(store);
+        return NULL;
+    }
+    chutni_scan_options options;
+    memset(&options, 0, sizeof options);
+    options.app_name = "chutni-conformance";
+    options.app_version = "1";
+    if (chutni_scan(store, &options, result) != CHUTNI_OK) {
+        chutni_close(store);
+        return NULL;
+    }
+    return store;
+}
+
+/* 14. Bounded hierarchical scanning: depth is enforced, hierarchy is recorded,
+   and what was not opened says so. */
+static void scenario_bounded_depth(void) {
+    char tree[512], store_path[512], path[700];
+    p(tree, sizeof tree, "hierarchy-tree");
+    build_tree(tree);
+
+    /* Depth zero enumerates the selected root and nothing else. */
+    p(store_path, sizeof store_path, "depth0.chutni");
+    chutni_scan_result zero;
+    chutni_store *store = bounded_store(store_path, tree, 0, &zero);
+    if (!store) { bad("14 depth zero scan", chutni_last_error(NULL)); return; }
+
+    snprintf(path, sizeof path, "%s/top.md", tree);
+    int root_file = source_exists(store, path);
+    snprintf(path, sizeof path, "%s/Alpha/a.md", tree);
+    int child_file = source_exists(store, path);
+    check("14 depth zero enumerates only the root",
+          root_file && !child_file && zero.directories_enumerated == 1,
+          "§11.1 root is depth 0");
+
+    char kind[32], observation[32];
+    snprintf(path, sizeof path, "%s/Alpha", tree);
+    int alpha_known = find_source(store, path, NULL, NULL, kind, observation,
+                                  NULL, NULL);
+    check("14 depth zero records child directories opaque",
+          alpha_known && !strcmp(kind, "directory") &&
+          !strcmp(observation, "opaque"),
+          "name observed, inside not");
+    check("14 depth zero counts what it did not open",
+          zero.depth_limited_directories == 2, "Alpha and Beta");
+    chutni_close(store);
+
+    /* Depth one adds the immediate child directories, and stops. */
+    p(store_path, sizeof store_path, "depth1.chutni");
+    chutni_scan_result one;
+    store = bounded_store(store_path, tree, 1, &one);
+    if (!store) { bad("14 depth one scan", chutni_last_error(NULL)); return; }
+
+    snprintf(path, sizeof path, "%s/Alpha/a.md", tree);
+    int alpha_file = source_exists(store, path);
+    snprintf(path, sizeof path, "%s/Alpha/Deep/d.md", tree);
+    int grandchild_file = source_exists(store, path);
+    check("14 depth one enumerates immediate children only",
+          alpha_file && !grandchild_file, "§11.1 d <= max_depth");
+
+    snprintf(path, sizeof path, "%s/Alpha/Deep", tree);
+    int deep_depth = -1;
+    int deep_known = find_source(store, path, NULL, NULL, kind, observation,
+                                 NULL, &deep_depth);
+    check("14 collapsed directory stays explicitly opaque",
+          deep_known && !strcmp(observation, "opaque") && deep_depth == 2,
+          "recorded by name, never opened");
+
+    /* Hierarchy: every source's parent is the directory that contains it. */
+    char root_id[CHUTNI_ID_STRLEN], alpha_id[CHUTNI_ID_STRLEN];
+    find_source(store, tree, root_id, NULL, NULL, NULL, NULL, NULL);
+    snprintf(path, sizeof path, "%s/Alpha", tree);
+    find_source(store, path, alpha_id, NULL, NULL, NULL, NULL, NULL);
+
+    chutni_source_info *kids = NULL;
+    size_t kid_count = 0;
+    chutni_list_children(store, alpha_id, &kids, &kid_count);
+    int parents_right = kid_count == 2;
+    for (size_t i = 0; i < kid_count; i++)
+        if (!kids[i].parent_source_id ||
+            strcmp(kids[i].parent_source_id, alpha_id) || kids[i].depth != 2)
+            parents_right = 0;
+    chutni_source_info_free(kids, kid_count);
+    check("14 directory sources have correct parents", parents_right,
+          "§12.5 parent_source_id is the hierarchy");
+
+    chutni_list_children(store, root_id, &kids, &kid_count);
+    int root_has_three = kid_count == 3;
+    chutni_source_info_free(kids, kid_count);
+    check("14 root contains its three immediate entries", root_has_three,
+          "Alpha, Beta, top.md");
+
+    /* The coverage manifest states the depth requested and the depth reached. */
+    char *coverage = NULL;
+    chutni_get_coverage(store, root_id, &coverage);
+    int manifest_right =
+        coverage && strstr(coverage, "\"max_depth\": 1") &&
+        strstr(coverage, "\"deepest_directory_enumerated\": 1") &&
+        strstr(coverage, "\"depth_limited_directories\": 1") &&
+        strstr(coverage, "\"complete_for_policy\": true") &&
+        strstr(coverage, "\"definition_mode\": \"adaptive\"");
+    check("14 coverage manifest records requested and achieved depth",
+          manifest_right, "§15.7");
+    if (!manifest_right && coverage) printf("        %s\n", coverage);
+    chutni_free(coverage);
+    chutni_close(store);
+}
+
+/* 15. Definitions must say how far they looked, and stop being current when
+   anything they were built from stops being current. */
+static void scenario_directory_definitions(void) {
+    char tree[512], store_path[512], path[700];
+    p(tree, sizeof tree, "definition-tree");
+    build_tree(tree);
+    p(store_path, sizeof store_path, "definitions.chutni");
+
+    chutni_scan_result first;
+    chutni_store *store = bounded_store(store_path, tree, 1, &first);
+    if (!store) { bad("15 definition scan", chutni_last_error(NULL)); return; }
+
+    char alpha_id[CHUTNI_ID_STRLEN], alpha_hash[CHUTNI_HASH_STRLEN];
+    snprintf(path, sizeof path, "%s/Alpha", tree);
+    find_source(store, path, alpha_id, alpha_hash, NULL, NULL, NULL, NULL);
+
+    chutni_producer model;
+    memset(&model, 0, sizeof model);
+    model.producer_kind = "model";
+    model.name = "conformance definer";
+    model.model_id = "example/definer";
+    model.model_revision = "1";
+    model.app_name = "chutni-conformance";
+    model.app_version = "1";
+    char model_id[CHUTNI_ID_STRLEN], definition_derivation[CHUTNI_ID_STRLEN];
+    chutni_producer_put(store, &model, model_id);
+
+    /* The artifact that the definition will declare as an input: the text of a
+       file inside Alpha. */
+    char a_id[CHUTNI_ID_STRLEN];
+    snprintf(path, sizeof path, "%s/Alpha/a.md", tree);
+    find_source(store, path, a_id, NULL, NULL, NULL, NULL, NULL);
+    chutni_artifact_info *a_artifacts = NULL;
+    size_t a_count = 0;
+    chutni_list_artifacts(store, a_id, &a_artifacts, &a_count);
+    char input_artifact[CHUTNI_ID_STRLEN] = "";
+    for (size_t i = 0; i < a_count; i++)
+        if (a_artifacts[i].artifact_kind &&
+            !strcmp(a_artifacts[i].artifact_kind, "extracted_text"))
+            snprintf(input_artifact, sizeof input_artifact, "%s",
+                     a_artifacts[i].artifact_id);
+    chutni_artifact_info_free(a_artifacts, a_count);
+
+    char input_refs[160];
+    snprintf(input_refs, sizeof input_refs,
+             "[{\"artifact_id\":\"%s\",\"required\":true}]", input_artifact);
+    chutni_derivation_put(store, model_id, "define_directory", NULL, "{}",
+                          input_refs, definition_derivation);
+
+    chutni_artifact definition;
+    memset(&definition, 0, sizeof definition);
+    definition.source_id = alpha_id;
+    definition.artifact_kind = CHUTNI_KIND_SOURCE_DEFINITION;
+    definition.artifact_origin = "model_generated";
+    definition.media_type = "text/plain";
+    definition.inline_text = "A folder of field notes.";
+    definition.source_content_hash = alpha_hash;
+    definition.derivation_id = definition_derivation;
+
+    /* Without local coverage the store must refuse it: a definition that does
+       not say how far it looked is indistinguishable from one that read
+       everything. */
+    char definition_id[CHUTNI_ID_STRLEN];
+    chutni_status refused = chutni_artifact_put(store, &definition, definition_id);
+    check("15 definition without local coverage is refused",
+          refused == CHUTNI_ERR_INVALID, "§15.6");
+
+    definition.metadata_json =
+        "{\"category\":\"field_notes\",\"coverage\":{"
+        "\"directory_depth\":1,\"evidence_scope\":\"direct_entries\","
+        "\"entries_observed\":2,\"files_read\":1,"
+        "\"child_directories_expanded\":0,\"descendants_collapsed\":1,"
+        "\"complete_for_policy\":true,"
+        "\"stop_reason\":\"" CHUTNI_STOP_COHERENT "\"}}";
+    chutni_status accepted = chutni_artifact_put(store, &definition, definition_id);
+    check("15 definition with coverage and stop reason is accepted",
+          accepted == CHUTNI_OK, "§15.6");
+
+    char *coverage = NULL;
+    chutni_get_coverage(store, alpha_id, &coverage);
+    check("15 a consumer can read the definition's local coverage",
+          coverage && strstr(coverage, CHUTNI_STOP_COHERENT) &&
+          strstr(coverage, "\"descendants_collapsed\": 1"),
+          "§15.6 stop_reason travels with the claim");
+    chutni_free(coverage);
+
+    const char *state = NULL;
+    chutni_check_freshness(store, definition_id, &state);
+    check("15 a fresh definition is current", state && !strcmp(state, "current"),
+          "§13.3");
+
+    /* A required input going stale takes the definition with it, even though
+       Alpha's own listing never moved. */
+    snprintf(path, sizeof path, "%s/Alpha/a.md", tree);
+    write_file(path, "Alpha now holds notes about something else entirely.\n");
+    const char *refreshed = NULL;
+    chutni_source_refresh(store, a_id, &refreshed);
+    chutni_check_freshness(store, definition_id, &state);
+    check("15 a stale derivation input stales the definition",
+          state && strcmp(state, "current"),
+          "§13.3 second clause; the listing did not change");
+
+    /* An unchanged listing is reused rather than rewritten. */
+    chutni_scan_options options;
+    memset(&options, 0, sizeof options);
+    options.app_name = "chutni-conformance";
+    options.app_version = "1";
+    chutni_scan_result again;
+    chutni_scan(store, &options, &again);
+    check("15 unchanged listings are reused",
+          again.listings_reused == 3 && again.listing_artifacts == 0,
+          "§13.5 same observation, not a new one");
+
+    /* Adding an entry changes the listing, which stales artifacts bound to it. */
+    char alpha_definition_hash[CHUTNI_HASH_STRLEN];
+    snprintf(alpha_definition_hash, sizeof alpha_definition_hash, "%s", alpha_hash);
+    snprintf(path, sizeof path, "%s/Alpha/added.md", tree);
+    write_file(path, "A new note appears.\n");
+    chutni_scan_result third;
+    chutni_scan(store, &options, &third);
+
+    char alpha_hash_after[CHUTNI_HASH_STRLEN];
+    snprintf(path, sizeof path, "%s/Alpha", tree);
+    find_source(store, path, NULL, alpha_hash_after, NULL, NULL, NULL, NULL);
+    check("15 a changed listing changes the directory's observation",
+          strcmp(alpha_definition_hash, alpha_hash_after) != 0,
+          "§13.5 listing hash is the directory's version");
+
+    chutni_artifact_info *alpha_artifacts = NULL;
+    size_t alpha_count = 0;
+    chutni_list_artifacts(store, alpha_id, &alpha_artifacts, &alpha_count);
+    int definition_withdrawn = 0;
+    for (size_t i = 0; i < alpha_count; i++)
+        if (alpha_artifacts[i].artifact_id &&
+            !strcmp(alpha_artifacts[i].artifact_id, definition_id) &&
+            alpha_artifacts[i].status &&
+            strcmp(alpha_artifacts[i].status, "active"))
+            definition_withdrawn = 1;
+    chutni_artifact_info_free(alpha_artifacts, alpha_count);
+    check("15 a changed listing stales dependent definitions",
+          definition_withdrawn, "§13.3");
+    chutni_close(store);
+}
+
+/* 16. §24.4. Absence means something only inside the region the scan covered. */
+static void scenario_partial_scan_safety(void) {
+    char tree[512], store_path[512];
+    p(tree, sizeof tree, "partial-tree");
+    build_tree(tree);
+    p(store_path, sizeof store_path, "partial.chutni");
+
+    chutni_scan_result deep;
+    chutni_store *store = bounded_store(store_path, tree, 3, &deep);
+    if (!store) { bad("16 deep scan", chutni_last_error(NULL)); return; }
+
+    char deep_file[700], beta_file[700];
+    snprintf(deep_file, sizeof deep_file, "%s/Alpha/Deep/d.md", tree);
+    snprintf(beta_file, sizeof beta_file, "%s/Beta/b.md", tree);
+    check("16 an unbounded-enough scan reaches the leaves",
+          source_exists(store, deep_file) && source_exists(store, beta_file),
+          "baseline for the shallow refresh");
+
+    /* Everything below the root vanishes, and a depth-zero refresh runs. It
+       never opened Alpha or Beta, so it has observed nothing about their
+       contents and must not claim they are gone. */
+    remove(deep_file);
+    remove(beta_file);
+
+    chutni_scan_options shallow;
+    memset(&shallow, 0, sizeof shallow);
+    shallow.app_name = "chutni-conformance";
+    shallow.app_version = "1";
+    shallow.use_override_max_depth = 1;
+    shallow.override_max_depth = 0;
+    chutni_scan_result refresh;
+    chutni_scan(store, &shallow, &refresh);
+
+    char state[32];
+    int deep_state_ok = find_source(store, deep_file, NULL, NULL, NULL, NULL,
+                                    state, NULL) && !strcmp(state, "present");
+    int beta_state_ok = find_source(store, beta_file, NULL, NULL, NULL, NULL,
+                                    state, NULL) && !strcmp(state, "present");
+    check("16 a shallow refresh does not mark deeper sources missing",
+          deep_state_ok && beta_state_ok && refresh.sources_marked_missing == 0,
+          "§24.4 absence is meaningful only inside the covered region");
+
+    /* A direct child of the enumerated root is a different matter: that
+       directory was opened, so its absence was actually observed. */
+    char top_file[700];
+    snprintf(top_file, sizeof top_file, "%s/top.md", tree);
+    remove(top_file);
+    chutni_scan_result second;
+    chutni_scan(store, &shallow, &second);
+    int top_missing = find_source(store, top_file, NULL, NULL, NULL, NULL,
+                                  state, NULL) && !strcmp(state, "missing");
+    check("16 a shallow refresh does mark its own children missing",
+          top_missing && second.sources_marked_missing == 1,
+          "§24.4 inside the covered region absence is evidence");
+    chutni_close(store);
+}
+
+/* 17. A second application, which did not perform the scan and shares no code
+   with whatever did, can determine exactly what was and was not inspected. */
+static void scenario_coverage_is_legible(void) {
+    char tree[512], store_path[512], path[700];
+    p(tree, sizeof tree, "legible-tree");
+    build_tree(tree);
+    p(store_path, sizeof store_path, "legible.chutni");
+
+    chutni_scan_result scanned;
+    chutni_store *writer = bounded_store(store_path, tree, 1, &scanned);
+    if (!writer) { bad("17 scan for consumer", chutni_last_error(NULL)); return; }
+    chutni_close(writer);
+
+    chutni_store *consumer = NULL;
+    if (chutni_open(store_path, 1, &consumer) != CHUTNI_OK) {
+        bad("17 consumer opens the store", chutni_last_error(NULL));
+        return;
+    }
+
+    char *manifest = NULL;
+    chutni_manifest_json(consumer, &manifest);
+    check("17 the writer advertised hierarchical capabilities",
+          manifest && strstr(manifest, "hierarchical_sources") &&
+          strstr(manifest, "bounded_coverage") &&
+          strstr(manifest, "directory_definitions") &&
+          strstr(manifest, "\"spec_version\": \"0.2\""),
+          "§35.1 a consumer can tell this store records coverage");
+    chutni_free(manifest);
+
+    char root_id[CHUTNI_ID_STRLEN];
+    find_source(consumer, tree, root_id, NULL, NULL, NULL, NULL, NULL);
+    char *coverage = NULL;
+    chutni_get_coverage(consumer, root_id, &coverage);
+    check("17 the consumer reads coverage without having scanned",
+          coverage && strstr(coverage, "\"directories_enumerated\": 3") &&
+          strstr(coverage, "\"depth_limited_directories\": 1"),
+          "§15.7");
+    chutni_free(coverage);
+
+    /* The distinction the whole feature exists for: this directory was named
+       but never opened, and the store says so rather than leaving the consumer
+       to assume the index is exhaustive. */
+    char observation[32];
+    snprintf(path, sizeof path, "%s/Alpha/Deep", tree);
+    int opaque = find_source(consumer, path, NULL, NULL, NULL, observation,
+                             NULL, NULL) && !strcmp(observation, "opaque");
+    snprintf(path, sizeof path, "%s/Alpha", tree);
+    int enumerated = find_source(consumer, path, NULL, NULL, NULL, observation,
+                                 NULL, NULL) && !strcmp(observation, "enumerated");
+    check("17 inspected and uninspected directories are distinguishable",
+          opaque && enumerated, "§12.5");
+
+    /* Search results carry the region's coverage so a hit cannot be mistaken
+       for evidence that the whole tree was read. */
+    chutni_search_request request;
+    memset(&request, 0, sizeof request);
+    request.query = "arctic terns";
+    request.limit = 5;
+    chutni_search_result *results = NULL;
+    size_t result_count = 0;
+    chutni_search(consumer, &request, &results, &result_count);
+    int annotated = result_count >= 1 && results[0].coverage_manifest_id &&
+                    results[0].source_kind &&
+                    !strcmp(results[0].source_kind, "file") &&
+                    results[0].parent_source_id && results[0].depth == 2;
+    check("17 search results carry hierarchy and coverage", annotated, "§19.3");
+    chutni_search_result_free(results, result_count);
+
+    /* §18: the hierarchy is also traversable as relations, each carrying the
+       provenance of the observation that asserted it. */
+    chutni_relation_info *relations = NULL;
+    size_t relation_count = 0;
+    chutni_relations_list(consumer, root_id, CHUTNI_REL_CONTAINS, &relations,
+                          &relation_count);
+    int all_have_provenance = relation_count == 3;
+    for (size_t i = 0; i < relation_count; i++)
+        if (!relations[i].derivation_id) all_have_provenance = 0;
+    chutni_relation_info_free(relations, relation_count);
+    check("17 contains relations carry provenance", all_have_provenance, "§18");
+
+    chutni_relations_list(consumer, NULL, CHUTNI_REL_OBSERVED_IN, &relations,
+                          &relation_count);
+    check("17 observed_in ties directories to a scan generation",
+          relation_count == 4, "§18, §15.7");
+    chutni_relation_info_free(relations, relation_count);
+    chutni_close(consumer);
+}
+
+/* A v0.1 store must keep working, and its silence about depth must not be read
+   as a depth of zero. */
+static void scenario_v01_compatibility(void) {
+    char tree[512], store_path[512];
+    p(tree, sizeof tree, "legacy-tree");
+    build_tree(tree);
+    p(store_path, sizeof store_path, "legacy.chutni");
+
+    chutni_store *store = NULL;
+    if (chutni_create(store_path, "legacy", &store) != CHUTNI_OK) {
+        bad("18 legacy store", chutni_last_error(NULL));
+        return;
+    }
+    /* A v0.1 policy: no max_depth field at all. */
+    char root_id[CHUTNI_ID_STRLEN];
+    chutni_root_add(store, tree, "tree", NULL, root_id);
+    chutni_close(store);
+
+    char manifest_path[600];
+    snprintf(manifest_path, sizeof manifest_path, "%s/manifest.json", store_path);
+    char *before = slurp(manifest_path);
+    int looks_v01 = before && !strstr(before, "hierarchical_sources");
+    free(before);
+    check("18 a store that has not used hierarchy does not advertise it",
+          looks_v01, "§35 write the oldest version that fits");
+
+    chutni_open(store_path, 0, &store);
+    chutni_scan_options options;
+    memset(&options, 0, sizeof options);
+    options.app_name = "chutni-conformance";
+    options.app_version = "1";
+    chutni_scan_result result;
+    chutni_scan(store, &options, &result);
+
+    char path[700];
+    snprintf(path, sizeof path, "%s/Alpha/Deep/d.md", tree);
+    check("18 a missing max_depth means unbounded, not zero",
+          source_exists(store, path) && result.deepest_directory_enumerated == 2,
+          "§11.1 legacy recursion is preserved");
+    chutni_close(store);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: conformance <work-dir>\n"); return 2; }
     snprintf(root_dir, sizeof root_dir, "%s", argv[1]);
     mkdir(root_dir, 0700);
+    /* Sources record absolute paths, so the fixture works in absolute paths
+       too; otherwise every lookup by path compares "build/work/x" against
+       "/home/.../build/work/x" and quietly finds nothing. */
+    {
+        char resolved[512];
+        if (realpath(root_dir, resolved))
+            snprintf(root_dir, sizeof root_dir, "%s", resolved);
+    }
 
     printf("Chutni conformance suite — SPEC.md §31 (spec %s, library %s)\n\n",
            chutni_spec_version(), chutni_library_version());
@@ -1022,6 +1545,11 @@ int main(int argc, char **argv) {
     scenario_prompt_injection();
     scenario_representation_compatibility();
     scenario_application_handoff();
+    scenario_bounded_depth();
+    scenario_directory_definitions();
+    scenario_partial_scan_safety();
+    scenario_coverage_is_legible();
+    scenario_v01_compatibility();
 
     printf("\n%d passed, %d failed, %d gaps\n", passes, failures, gaps);
     if (gaps) printf("Gaps are unimplemented scenarios, not passes.\n");

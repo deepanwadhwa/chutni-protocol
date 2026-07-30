@@ -1,8 +1,27 @@
 # Chutni Protocol Specification
 
-**Version:** 0.1-draft
-**Status:** Proposed initial specification
+**Version:** 0.2-draft
+**Status:** Proposed; v0.1 stores remain readable
 **Scope:** Portable, source-backed memory artifacts for local files and AI applications
+
+**What v0.2 adds.** Directories become sources in their own right, scans become
+depth-bounded and say how far they reached, and definitions must record how
+much they actually looked at. The additions are capability-gated (§38): a v0.1
+store stays valid and readable, and its silence about depth means the unbounded
+recursion it performed, never depth zero.
+
+| Added | Section |
+|---|---|
+| Depth bounds, memory goal, definition mode | §11.1, §11.2 |
+| Directory sources and `parent_source_id` hierarchy | §12.5 |
+| Directory observation and listing hashes | §13.5 |
+| Artifact validity extended to derivation inputs | §13.3 |
+| `directory_listing`, `source_definition`, `coverage_manifest` | §15.5–§15.7 |
+| Hierarchy predicates | §18 |
+| Coverage fields on search results | §19.3 |
+| `observe_directory`, `list_children`, `get_coverage`, `scan` | §20 |
+| Bounded reconciliation of absent sources | §24.4 |
+| Compatibility rules | §38 |
 
 ## 1. Abstract
 
@@ -240,12 +259,37 @@ A v0.1 manifest MUST be UTF-8 JSON and MUST contain:
 * `spec_version` MUST identify the Chutni specification version.
 * `store_id` MUST be a globally unique identifier. UUIDv7 is recommended.
 * `created_at` and `updated_at` MUST use RFC 3339 UTC timestamps.
-* `hash_algorithm` MUST be `blake3` in v0.1.
+* `hash_algorithm` MUST be `blake3`.
 * `catalog` MUST identify the catalog path.
 * `object_root` MUST identify the content-addressed object path.
 * `privacy.external_disclosure_default` MUST be `deny` unless the user explicitly changes it.
 
 Unknown manifest fields MUST be preserved by applications that rewrite the manifest, unless the user explicitly requests cleanup.
+
+`capabilities` names the optional behavior a store's writers have used. v0.2
+reserves three:
+
+```json
+{
+  "spec_version": "0.2",
+  "capabilities": [
+    "sources", "artifacts", "provenance",
+    "hierarchical_sources", "bounded_coverage", "directory_definitions"
+  ]
+}
+```
+
+* `hierarchical_sources` — the store contains directory sources with
+  `parent_source_id` hierarchy (§12.5).
+* `bounded_coverage` — scans were depth-bounded and recorded coverage
+  manifests (§11.1, §15.7).
+* `directory_definitions` — directory `source_definition` artifacts carrying
+  local coverage may be present (§15.6).
+
+A writer that records hierarchical coverage MUST advertise the corresponding
+capability, and SHOULD add it at the point it first uses the feature rather
+than at store creation, so that `capabilities` describes what the store
+actually holds. §38 governs what a consumer may conclude from their absence.
 
 ## 10. Catalog schema
 
@@ -400,11 +444,76 @@ A producer MUST NOT index outside configured roots unless the user grants additi
     "**/node_modules/**",
     "**/.cache/**"
   ],
-  "max_file_size_bytes": 2147483648
+  "max_file_size_bytes": 2147483648,
+  "max_depth": 1,
+  "memory_goal": "define",
+  "definition_mode": "adaptive"
 }
 ```
 
 Producers MAY define additional policy fields.
+
+### 11.1 Maximum depth
+
+A user who points an application at a folder has not thereby asked it to read
+everything underneath. `max_depth` bounds how far a scan descends, and the
+bound is normative rather than advisory.
+
+* The selected root directory is **depth 0**.
+* A directory at depth *d* MAY be enumerated only when *d* ≤ `max_depth`.
+* **Enumerating** a directory means observing its immediate files and
+  child-directory names. It does not mean opening those child directories.
+* Child directories discovered past the limit MUST be recorded as **opaque**
+  sources — their names were observed — and MUST NOT be opened.
+
+Therefore:
+
+| `max_depth` | Enumerated |
+|---|---|
+| `0` | the selected root only |
+| `1` | also its immediate child directories |
+| `2` | also its grandchildren |
+| `null` or omitted | unbounded recursion (the v0.1 behavior) |
+
+An absent `max_depth` MUST be read as unbounded, **not** as depth zero. A v0.1
+store has no such field and recorded a full recursive walk; reading its silence
+as a bound would discard everything it indexed. A policy that considered depth
+and chose unbounded SHOULD write an explicit `null`, so a reader can tell a
+deliberate choice from a field that did not exist yet.
+
+The depth limit MUST be enforced by the host or library performing the walk. It
+MUST NOT be delegated to a language model. A model may be asked which
+directories are worth opening; it MUST NOT be the thing that stops the walk,
+because a bound that depends on a model's judgement is not a bound.
+
+`recursive: false` means `max_depth: 0`. Where both are present and disagree,
+the more restrictive applies.
+
+### 11.2 Memory goal and definition mode
+
+A policy SHOULD record why the memory is being built, so that a later scan — or
+a different application — can tell what "finished" was supposed to mean.
+
+```json
+{
+  "memory_goal": "define",
+  "definition_mode": "adaptive",
+  "max_depth": 1
+}
+```
+
+`definition_mode` has two standard values:
+
+* **`adaptive`** — a coherent directory MAY be represented by a single
+  directory definition, with the descendants it stands for recorded as
+  collapsed (§15.6).
+* **`per_source`** — every reached supported file MUST receive an artifact or
+  an explicit processing status (§12.4). This does **not** require a separate
+  model call per file: deterministic metadata or extraction satisfies it.
+
+This specification standardizes what these modes mean for coverage accounting.
+It does not standardize the prompt, the classifier, the category vocabulary, or
+which model is used. Those are producer decisions recorded with provenance.
 
 ## 12. Source identity and location
 
@@ -466,6 +575,47 @@ These identifiers help detect renames but MUST NOT be assumed portable across ma
 
 A producer SHOULD distinguish `missing` from `deleted` when the operating system provides enough evidence.
 
+### 12.5 Directory sources
+
+A directory is a source in its own right, not a path prefix on a file's
+locator. `source_kind` MUST be one of:
+
+* `file`
+* `directory`
+
+Requirements:
+
+* The selected root MUST receive its own directory source, with
+  `parent_source_id` null.
+* Every observed child directory MUST receive a stable source ID.
+* `parent_source_id` records the filesystem hierarchy. A file's
+  `parent_source_id` is the directory source containing it.
+* Directory sources MAY carry definitions, listings, provenance, freshness, and
+  relationships exactly as files do.
+
+```text
+Downloads                      directory source, depth 0
+└── Visual Studio Code.app     directory source, depth 1
+    └── Contents               directory source, depth 2, if expanded
+```
+
+A directory source's `metadata_json` SHOULD record:
+
+* `depth` — depth below the root directory source, which is 0.
+* `observation` — `enumerated` when its immediate entries were observed, or
+  `opaque` when its name was observed and it was never opened (§11.1).
+
+An opaque directory has no listing and therefore no `content_hash`. The
+distinction is the point of the feature: a consumer must be able to tell "this
+directory contains nothing we recorded" from "we never looked inside this
+directory", and those are otherwise the same empty result.
+
+Because a directory has no bytes, artifacts derived from one bind to an
+observation of it rather than to file content (§13.5). A producer MUST NOT
+record a content-derived artifact against an opaque directory: there is no
+observation for it to describe. A producer that wants to describe an unopened
+directory observes it first (§20), which is one directory and no recursion.
+
 ## 13. Hashing and freshness
 
 ### 13.1 Content hash
@@ -484,21 +634,98 @@ A producer MAY store a quick hash or fingerprint for change detection. A quick h
 
 ### 13.3 Artifact validity
 
-Every artifact derived from file contents MUST store `source_content_hash`.
+Every artifact derived from a source MUST store `source_content_hash`, binding
+it to the exact version of the source it describes.
 
-An artifact is current only when:
+An artifact is current only when **both** of these hold:
 
 ```text
-artifact.source_content_hash == source.content_hash
+the source observation it was derived from is still current
+AND every required input in its derivation is still current
 ```
 
-If the source hash changes, prior artifacts MUST be marked `stale` or superseded. They MUST NOT remain silently `active`.
+For a file, "the source observation" is the hash of its bytes. For a directory,
+it is the hash of the observed listing (§13.5).
+
+The second clause is new in v0.2, and it is what makes a derived description
+honest. A directory definition written from three child summaries is a claim
+about those summaries; if one of them describes bytes that no longer exist, the
+definition describes them too, however untouched the directory's own listing
+looks. Where a producer used child artifacts, it MUST record them in the
+derivation's `input_refs_json`:
+
+```json
+[
+  { "artifact_id": "019f...", "required": true },
+  { "artifact_id": "019f...", "required": false }
+]
+```
+
+An entry with no `required` field is required. An artifact becomes stale when
+any required input becomes stale.
+
+Verifying an artifact MUST re-derive the source observation from the
+filesystem. Comparing `artifact.source_content_hash` against
+`source.content_hash` alone is insufficient: both are catalog state, so when a
+file changes and nothing has rescanned it, the two agree with each other while
+the disk says otherwise, and the artifact reports itself current while
+describing content that is gone.
+
+If a source observation changes, prior artifacts MUST be marked `stale` or
+superseded. They MUST NOT remain silently `active`. Implementations MUST
+propagate this transitively: an artifact whose required input has just been
+demoted is itself no longer current, and one pass of verification must not
+leave a chain half-withdrawn.
 
 ### 13.4 Watchers
 
 Producers MAY use FSEvents, the Windows USN journal, `ReadDirectoryChangesW`, `inotify`, `fanotify`, polling, or another mechanism.
 
 File watchers are an optimization. A producer SHOULD periodically verify hashes because watchers can miss events, mounted drives can disappear, and stores can be transferred between systems.
+
+### 13.5 Directory observation
+
+A directory has no bytes to hash. What identifies it is **one observed
+immediate listing**: the entries it held and what kind each one was.
+
+A directory source's `content_hash` MUST be the hash of its canonical listing,
+computed over this exact serialization:
+
+```text
+chutni-listing-1\n
+<name>\t<source_kind>\n      (one line per entry, sorted by raw name bytes)
+```
+
+* `source_kind` is `file` or `directory`.
+* Entries are sorted by the raw entry name compared bytewise. Directory read
+  order is undefined and differs between filesystems; two computers observing
+  the same directory MUST compute the same hash.
+* In `<name>`, a backslash is escaped as `\\`, tab as `\t`, newline as `\n`,
+  and carriage return as `\r`. POSIX permits tabs and newlines in filenames,
+  and an entry that could forge a line boundary would let two different
+  directories collide on one hash.
+
+The listing deliberately excludes two things:
+
+* **File contents.** A file changing inside a directory does not change the
+  directory's membership. Folding content hashes in here would make every edit
+  anywhere invalidate every enclosing listing up to the root. Content changes
+  reach a directory's definition through derivation inputs instead (§13.3),
+  which is the mechanism that can say *which* input went stale.
+* **Media types.** These are derived from the name by a table an implementation
+  may extend, and a listing hash that moved when that table grew would stale
+  every directory in every store on upgrade.
+
+A listing is **policy-relative**: it contains exactly the entries the root
+policy admits, so changing `include_hidden` or `follow_symlinks` changes what a
+listing observes and therefore its hash. That is intended — a different policy
+is a different observation, not the same observation retold.
+
+Checking a directory's freshness re-enumerates **only that directory** and
+compares the resulting listing. It MUST NOT descend. Checking an opaque
+directory's freshness MUST NOT open it: the only claim ever made about it is
+that a directory of that name is there, and confirming that requires a stat,
+not an enumeration.
 
 ## 14. Objects
 
@@ -559,6 +786,12 @@ Chutni v0.1 reserves the following artifact kinds:
 * `content_warning`;
 * `processing_error`.
 
+v0.2 reserves three more, specified in §15.5–§15.7:
+
+* `directory_listing`;
+* `source_definition`;
+* `coverage_manifest`.
+
 Applications MAY use namespaced artifact kinds, such as:
 
 ```text
@@ -614,6 +847,149 @@ If an artifact describes the entire source, `selector_json` MAY be null.
 * `deleted`.
 
 Only `active` artifacts SHOULD be returned by default search operations.
+
+### 15.5 `directory_listing`
+
+A deterministic record of the immediate entries actually observed in one
+directory. It MUST be attached to a directory source, and its
+`source_content_hash` MUST be the listing hash of §13.5.
+
+```json
+{
+  "entries": [
+    {
+      "source_id": "019f...",
+      "name": "Visual Studio Code.app",
+      "source_kind": "directory"
+    },
+    {
+      "source_id": "019f...",
+      "name": "report.pdf",
+      "source_kind": "file",
+      "media_type": "application/pdf",
+      "size_bytes": 91234
+    }
+  ],
+  "listing_hash": "blake3:...",
+  "immediate_only": true
+}
+```
+
+A `directory_listing` MUST NOT imply knowledge of unexpanded descendants. It
+names child directories; it says nothing about what is inside them.
+
+`source_id` values are local to the store and are not portable between stores,
+which is why the listing hash of §13.5 is computed over names and kinds only.
+A consumer comparing two stores compares listing hashes, not payload bytes.
+
+### 15.6 `source_definition`
+
+A concise semantic definition of a file or directory.
+
+```json
+{
+  "definition": "A macOS application bundle containing Visual Studio Code.",
+  "category": "application_bundle"
+}
+```
+
+The definition text and its provenance are portable. `category` MAY remain
+producer-defined; this specification does not standardize a category
+vocabulary, and a consumer MUST NOT assume two producers mean the same thing by
+the same category string.
+
+**Local coverage is required on directory definitions.** A `source_definition`
+attached to a directory source MUST carry a `coverage` object in its
+`metadata_json`:
+
+```json
+{
+  "coverage": {
+    "directory_depth": 1,
+    "evidence_scope": "direct_entries",
+    "entries_observed": 24,
+    "files_read": 0,
+    "child_directories_expanded": 0,
+    "descendants_collapsed": 1,
+    "complete_for_policy": true,
+    "stop_reason": "producer_classified_coherent"
+  }
+}
+```
+
+`stop_reason` and `complete_for_policy` are mandatory. Standard stop reasons:
+
+* `max_depth_reached`
+* `producer_classified_coherent`
+* `budget_reached`
+* `excluded_by_policy`
+* `unsupported`
+* `unreadable`
+* `user_canceled`
+
+The set is open; these are the values every consumer is expected to understand.
+
+This requirement is what prevents another application from reading a shallow
+definition as exhaustive knowledge. A definition written from four filenames
+and a definition written from an entire subtree are otherwise the same record,
+and the difference between them is the whole point. A store SHOULD refuse a
+directory definition that does not carry this block.
+
+### 15.7 `coverage_manifest`
+
+One deterministic artifact per scan generation, attached to the root directory
+source, recording the exact policy requested and the coverage achieved.
+
+```json
+{
+  "scan_generation": "019f...",
+  "root_source_id": "019f...",
+  "policy": {
+    "memory_goal": "define",
+    "definition_mode": "adaptive",
+    "max_depth": 1
+  },
+  "coverage": {
+    "deepest_directory_enumerated": 1,
+    "directories_observed": 14,
+    "directories_enumerated": 6,
+    "directories_defined": 11,
+    "directories_collapsed": 8,
+    "files_observed": 63,
+    "files_hashed": 63,
+    "files_read": 12,
+    "files_defined": 17,
+    "depth_limited_directories": 9,
+    "excluded_sources": 4,
+    "unsupported_sources": 2,
+    "sources_marked_missing": 0,
+    "errors": 0
+  },
+  "complete_for_policy": true
+}
+```
+
+Field meanings that are easy to overstate:
+
+* `files_read` counts files whose **contents were read for extraction**, as
+  distinct from files merely observed or hashed. `files_hashed` counts those
+  whose bytes were read to compute a content hash.
+* `directories_collapsed` counts directories inside a defined subtree that
+  carry no definition of their own, because an ancestor's definition stands for
+  them (§11.2, `adaptive`).
+* `depth_limited_directories` counts directories this generation declined to
+  open because of `max_depth`.
+
+**`complete_for_policy` means Chutni completed the requested bounded
+operation.** It does not mean the complete subtree was read. A consumer MUST
+NOT translate it into a claim of exhaustive coverage, and an implementation
+presenting it to a user or a model SHOULD say which one it means.
+
+A new generation's manifest SHOULD supersede the previous one (§23) rather than
+replace it: how far a past scan reached is part of the store's history. A
+manifest SHOULD be written for every committed scan even when nothing changed,
+because "we looked again and it was the same" is a different fact from "nobody
+has looked".
 
 ## 16. Producer provenance
 
@@ -785,7 +1161,30 @@ Core predicates include:
 * `attachment_of`;
 * `thumbnail_of`.
 
-Relations created by a model MUST carry a derivation ID.
+v0.2 adds three, for hierarchy and coverage:
+
+* `summarizes`;
+* `defined_by`;
+* `observed_in`.
+
+`parent_source_id` (§12.5) remains the canonical filesystem hierarchy. Relations
+restate it, and carry the rest:
+
+```text
+directory source     --contains-->     child source
+definition artifact  --summarizes-->   source
+source               --defined_by-->   definition artifact
+source               --observed_in-->  coverage_manifest artifact
+```
+
+A producer MAY record `observed_in` for directory sources only, since directory
+membership is what bounds a region and a file's membership follows from its
+parent's `contains` edge. It MAY record it per file where the extra precision
+is worth the rows.
+
+Relations created by a model MUST carry a derivation ID. An implementation
+cannot tell from the outside which relations came from a model, so a store MAY
+require a derivation ID for every relation; the reference implementation does.
 
 A relation is not automatically a verified fact. Consumers should inspect its provenance.
 
@@ -842,11 +1241,21 @@ A result SHOULD contain:
   "score_type": "implementation_specific_hybrid",
   "freshness": "current",
   "producer_id": "...",
-  "selector": {"type":"image_region","x":0,"y":0,"width":1,"height":1,"units":"normalized"}
+  "selector": {"type":"image_region","x":0,"y":0,"width":1,"height":1,"units":"normalized"},
+  "source_kind": "file",
+  "parent_source_id": "...",
+  "coverage_manifest_id": "...",
+  "depth": 2
 }
 ```
 
 Scores from different implementations MUST NOT be assumed comparable. `score_type` is REQUIRED whenever `score` is returned.
+
+A store advertising `bounded_coverage` (§9.1) SHOULD return `source_kind`,
+`parent_source_id`, `coverage_manifest_id`, and `depth` on every result. A path
+and a snippet cannot tell a consumer whether the region a hit came from was
+indexed exhaustively or read one level deep, and a consumer with no way to tell
+will assume the former. `coverage_manifest_id` is where it goes to find out.
 
 ### 19.4 Search behavior
 
@@ -873,7 +1282,30 @@ put_artifacts(producer, derivation, artifacts[])
 mark_source_missing(source_id)
 forget_source(source_id, mode)
 rebuild_indexes()
+
+observe_directory(source_id)
+list_children(source_id)
+get_coverage(root_id | source_id)
+scan(root_id, policy)
 ```
+
+`observe_directory` is the important addition. It enumerates **exactly one**
+authorized directory — recording its immediate files and child-directory names
+— and recurses into nothing. A host can then decide, child by child, whether to
+expand. Without it, the only available granularity is "walk the whole tree" and
+the decision about how far to read is taken by the walk rather than by the
+application or the user.
+
+`get_coverage` MUST be answerable by a consumer that did not perform the scan
+and shares no code with whatever did.
+
+Existing artifact-write operations MUST also:
+
+* accept directory sources;
+* accept explicit derivation input references (§13.3);
+* not assume every source is a regular file; and
+* validate a directory source's freshness through its listing artifact (§13.5)
+  rather than by attempting to hash it.
 
 A read-only consumer MAY implement only:
 
@@ -976,6 +1408,34 @@ The store MAY retain derived artifacts to preserve historical memory, depending 
 * `purge` — remove records and unshared object payloads immediately when possible.
 
 The protocol cannot guarantee physical erasure on copy-on-write file systems, SSDs, backups, or synchronized storage. Applications MUST not claim guaranteed forensic erasure.
+
+### 24.4 Absence inside a bounded scan
+
+> **Absence is meaningful only inside the region actually covered by the
+> current scan.**
+
+A bounded scan MUST NOT mark deeper sources missing merely because it did not
+visit them. Not looking is not evidence of absence, and a store that conflates
+the two will quietly report a user's files as gone every time an application
+performs a shallow refresh.
+
+Concretely: reconciliation runs per enumerated directory and considers only
+that directory's own children. A depth-zero refresh MAY mark a deleted direct
+child of the root missing, because it enumerated the root and observed the
+absence. It MUST NOT mark previously known grandchildren missing, because it
+never opened the directories that would have told it.
+
+A source that has vanished from an enumerated directory's listing has not
+necessarily been deleted. A producer SHOULD distinguish:
+
+* the entry is absent from the filesystem → `missing` (or `deleted`, §24.2);
+* the entry is present but the policy no longer admits it → `excluded`;
+* the entry is present but is neither a regular file nor a directory →
+  `unsupported`.
+
+This rule also keeps coverage honest: sources outside the covered region must
+not be counted into a generation's totals, or a shallow scan will report
+progress against work it did not do.
 
 ## 25. Multimodal ingestion guidance
 
@@ -1195,6 +1655,21 @@ The Chutni project SHOULD publish a test suite containing:
     selected directory, a second host reads and updates it, and the first host
     can read the update without migration.
 
+An implementation advertising `hierarchical_sources` or `bounded_coverage`
+(§9.1) SHOULD additionally publish results for:
+
+14. **Depth zero** enumerates only the selected root.
+15. **Depth one** enumerates immediate child directories but no grandchildren.
+16. Directory sources have correct parents.
+17. Collapsed directories remain explicitly opaque.
+18. Every directory definition reports local coverage and a stop reason.
+19. A coverage manifest contains both the requested and the achieved depth.
+20. A shallow refresh does not mark deeper sources missing.
+21. A changed directory listing stales dependent definitions.
+22. Unchanged listings and definitions are reused rather than rewritten.
+23. Another consumer can determine exactly what was and was not inspected.
+24. A v0.1 store with no `max_depth` still scans unbounded.
+
 A conforming implementation SHOULD publish which conformance level and optional capabilities it passes.
 
 ## 32. Example: image artifact
@@ -1353,6 +1828,34 @@ Chutni uses semantic specification versions.
 Readers MUST reject unsupported major versions unless operating in an explicit best-effort recovery mode.
 
 Writers SHOULD write the oldest specification version that accurately represents the features used.
+
+### 35.1 Capability compatibility
+
+v0.2's hierarchical additions are capability-backed rather than mandatory. The
+rules that keep both directions safe:
+
+1. **Existing v0.1 stores remain readable.** A v0.2 implementation MUST open a
+   store that has no directory sources, no coverage manifests, and no
+   hierarchical capabilities, and MUST NOT rewrite it into the new shape as a
+   side effect of reading.
+2. **A missing `max_depth` means legacy unbounded behavior, not depth zero**
+   (§11.1). This is the single most damaging misreading available, because it
+   turns a full index into an apparently empty one.
+3. **Unknown artifact kinds and policy fields continue to be preserved.** An
+   implementation that does not understand `coverage_manifest`, or a policy
+   field it has never heard of, MUST leave both intact (§9.1, §29).
+4. **A writer using hierarchical coverage MUST advertise the capability**
+   (§9.1), at the point it first uses it.
+5. **A consumer that does not understand coverage MUST NOT claim the directory
+   was exhaustively indexed.** In the absence of a coverage manifest, the
+   honest statement is that coverage is unknown — not that it is complete. An
+   absent manifest means nobody recorded how far they looked; it does not mean
+   nothing was covered, and it does not mean everything was.
+
+A v0.1 reader opening a v0.2 store sees directory sources as ordinary sources
+with an unfamiliar `source_kind`, and sees artifact kinds it does not know.
+Rule 5 is what stops it from reporting that store as an exhaustive index of a
+tree that was read one level deep.
 
 ## 36. Governance principles
 

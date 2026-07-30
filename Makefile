@@ -8,9 +8,18 @@ AR      ?= ar
 BUILD   ?= build
 PREFIX  ?= /usr/local
 
+# The implementation's release version, and the only place it is written down.
+# It is distinct from the protocol version in include/chutni.h: the spec version
+# says which format a store is in, this says which build produced it. The two
+# move independently, and a producer record carries this one (§16.1), so a
+# stale copy in one source file would misattribute artifacts to a build that
+# never made them.
+VERSION := $(shell cat VERSION)
+
 WARN    := -std=c99 -Wall -Wextra -Wshadow -Wpointer-arith -Wwrite-strings -Werror
 OPT     ?= -O2
-CFLAGS  += $(WARN) $(OPT) -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite
+VERDEF  := -DCHUTNI_VERSION='"$(VERSION)"'
+CFLAGS  += $(WARN) $(OPT) $(VERDEF) -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite
 
 # The portable BLAKE3 build. Runtime SIMD dispatch is deliberately off: the
 # reference implementation values one identical code path everywhere over
@@ -45,8 +54,11 @@ $(CLI): $(BUILD)/src/cli.o $(LIBCHUTNI)
 $(MCP): $(BUILD)/src/mcp.o $(LIBCHUTNI)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) -lpthread
 
-# First-party code is held to -Werror.
-$(BUILD)/src/%.o: src/%.c include/chutni.h src/cj.h
+# First-party code is held to -Werror. VERSION is a prerequisite because the
+# release string is compiled in: without it, editing VERSION leaves stale
+# objects reporting the previous version, which is the one kind of version bug
+# that survives a rebuild and lies in provenance records.
+$(BUILD)/src/%.o: src/%.c include/chutni.h src/cj.h VERSION
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(B3FLAGS) $(SQLFLAGS) -c $< -o $@
 
@@ -69,7 +81,7 @@ $(BUILD)/blake3_vectors: tests/blake3_vectors.c $(B3_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) -std=c99 $(OPT) -Ithird_party/blake3 $(B3FLAGS) $^ -o $@
 
-$(BUILD)/conformance: tests/conformance/conformance.c $(LIBCHUTNI)
+$(BUILD)/conformance: tests/conformance/conformance.c $(LIBCHUTNI) VERSION
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(LIBCHUTNI) -lpthread -o $@
 
@@ -90,7 +102,7 @@ conformance: test
 # because sanitized and unsanitized objects must not be mixed.
 SAN      := -fsanitize=address,undefined -fno-omit-frame-pointer
 SAN_SRC  := $(LIB_SRC) $(B3_SRC) third_party/sqlite/sqlite3.c
-SAN_DEFS := -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite $(B3FLAGS) $(SQLFLAGS)
+SAN_DEFS := -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite $(B3FLAGS) $(SQLFLAGS) $(VERDEF)
 
 sanitize:
 	@mkdir -p $(BUILD)/san

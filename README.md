@@ -11,7 +11,9 @@ file's current bytes. It is deliberately not tied to one application, one model,
 or one operating system: a store built by one program can be read, searched, and
 improved by another.
 
-- **Specification:** [SPEC.md](SPEC.md) (version 0.1-draft)
+- **Specification:** [SPEC.md](SPEC.md) (version 0.2-draft; v0.1 stores remain readable)
+- **This implementation:** `0.2.0` — see [VERSION](VERSION). The release version
+  and the protocol version move independently; `chutni version` prints both.
 - **License:** Apache-2.0. Royalty-free to implement.
 
 ## Why this exists
@@ -49,12 +51,20 @@ Honest summary of what runs today, on one machine (macOS 15 / arm64, Apple M3).
 | Semantic search (§19.1) | built in the C API as brute-force cosine; hybrid search is not built |
 | Application Host lifecycle (§30.5, §40) | specified, documented, handoff scenario tested |
 | Reusable local service (`chutni-mcp`) | built; MCP stdio and native one-shot modes tested |
+| Directories as sources, `parent_source_id` hierarchy (§12.5) | built, tested |
+| Depth-bounded scans, enforced in the library (§11.1) | built, tested |
+| Coverage manifests per scan generation (§15.7) | built, tested |
+| Directory definitions with required local coverage (§15.6) | built; refused at write without a stop reason |
+| Directory freshness by listing re-enumeration (§13.5) | built, tested |
+| One-directory observation without recursion (§20) | built, tested |
+| `exclude_globs` enforcement (§11) | **not built**; exclusion is a fixed name list |
 
 `make test` reports the unbuilt conformance scenarios as GAP rather than
 counting them as passes. Verified only on macOS 15 / arm64 (Apple M3) — the
 only machine this has run on. See
-[docs/evidence/](docs/evidence/2026-07-29-v0.1/report.md) for what that does and
-does not cover, and [docs/TASKS.md](docs/TASKS.md) for the work list.
+[docs/evidence/](docs/evidence/2026-07-30-v0.2-hierarchical-coverage/report.md)
+for what that does and does not cover, and [docs/TASKS.md](docs/TASKS.md) for
+the work list.
 
 ## Build
 
@@ -84,10 +94,45 @@ chutni scan
 # Then use it.
 chutni search "condensation force"
 chutni inspect ~/Documents/paper.md      # what was derived, and by what
-chutni verify                            # re-hash sources, retire stale artifacts
+chutni verify                            # re-observe sources, retire stale artifacts
 ```
 
 Every command takes `--json`, because the main consumers are agents.
+
+### Reading a folder without reading all of it
+
+Pointing an application at a folder is not the same as asking it to open
+everything underneath. A root can carry a depth bound, and the library enforces
+it (§11.1) — not the caller, and not a model.
+
+```sh
+chutni add-root ~/Downloads --max-depth 1 --goal define
+chutni scan
+```
+
+```text
+Observed 17 directories and 24 files
+  directories enumerated  8  (deepest depth 1)
+  recorded but not opened 9  (past max_depth)
+  ...
+This is complete for the policy requested, not a complete reading of the subtree.
+```
+
+Directories past the bound are recorded by name and never opened, so a consumer
+can tell "nothing is in here" from "we never looked in here":
+
+```sh
+chutni children ~/Downloads/SomeApp.app
+# directory opaque  ~/Downloads/SomeApp.app/Contents
+
+chutni observe ~/Downloads/SomeApp.app/Contents   # exactly one directory, no recursion
+chutni coverage                                    # what the last scan reached
+```
+
+`chutni coverage` reads the coverage manifest, which every scan writes. Any
+application can read it, including one that did not perform the scan — which is
+the point. A bounded scan that a second application mistakes for an exhaustive
+index is worse than no index.
 
 ## Use from an application
 
@@ -159,13 +204,13 @@ chutni discover --json
 
 ```json
 {
-  "spec_version": "0.1",
+  "spec_version": "0.2",
   "count": 1,
   "stores": [
     {
       "path": "/Users/deepan/Memory.chutni",
       "store_id": "0195f0c4-83f8-7d4f-a2dc-c91d9201287a",
-      "spec_version": "0.1",
+      "spec_version": "0.2",
       "label": "My files",
       "readable": true
     }
@@ -179,7 +224,7 @@ documents directories. It never scans the whole filesystem. See [§39](SPEC.md).
 
 Ready-made agent instructions live in [skills/](skills/).
 
-## Three rules worth reading before you build on this
+## Four rules worth reading before you build on this
 
 **Memory is a map, not the source of truth.** An artifact tells you *where* to
 look and roughly what is there. For anything exact, reopen the file. If you
@@ -194,6 +239,12 @@ model-confidence field to imply otherwise. (§6.2)
 look like instructions to whatever model reads it. Retrieval carries no
 privilege: Chutni hands back bytes and a path, never a command. Consumers must
 keep it that way. (§6.5, §28)
+
+**Not looking is not the same as finding nothing.** A store records how far each
+scan reached. An empty result inside a region that was never opened means
+nothing at all, and `complete_for_policy` means the requested bounded operation
+finished — never that the subtree was read. If you have no coverage manifest,
+the honest word is "unknown", not "complete". (§15.7, §24.4, §35.1)
 
 ## Contributing
 

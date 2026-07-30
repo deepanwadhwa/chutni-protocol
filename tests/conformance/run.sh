@@ -3,12 +3,20 @@
 #
 # Runs against a throwaway CHUTNI_HOME so a test never touches the real
 # registry, and a throwaway work directory so it never touches real files.
+#
+# HOME is redirected too. CHUTNI_HOME only moves the registry, while §39
+# discovery also sweeps the conventional locations under $HOME — so on a
+# machine that has real stores in ~/ or ~/Documents, "discover finds nothing on
+# a fresh machine" failed against the developer's own memory rather than
+# against anything the suite created.
 set -eu
 
 CLI="${1:?usage: run.sh <path to chutni binary>}"
 WORK="$(mktemp -d)"
 CHUTNI_HOME="$WORK/home"
-export CHUTNI_HOME
+HOME="$WORK/home"
+export CHUTNI_HOME HOME
+mkdir -p "$HOME"
 unset CHUTNI_STORE 2>/dev/null || true
 
 cleanup() { rm -rf "$WORK"; }
@@ -113,6 +121,78 @@ check_output "ambiguous store selection refuses to guess" "choose one with --sto
 
 check_output "unregister removes a store from discovery" "Unregistered" \
     "$CLI" unregister "$WORK/Second.chutni"
+
+# ------------------------------------------------------- bounded coverage
+#
+# The paths an agent drives when it is deciding how much of a folder to open.
+
+mkdir -p "$WORK/tree/Alpha/Deep" "$WORK/tree/Alpha/Other" "$WORK/tree/Beta"
+printf 'top level notes\n'          > "$WORK/tree/top.md"
+printf 'alpha notes on terns\n'     > "$WORK/tree/Alpha/a.md"
+printf 'deep notes on octopus\n'    > "$WORK/tree/Alpha/Deep/d.md"
+printf 'other notes on pangolin\n'  > "$WORK/tree/Alpha/Other/o.md"
+printf 'beta notes on wombats\n'    > "$WORK/tree/Beta/b.md"
+
+BOUNDED="$WORK/Bounded.chutni"
+"$CLI" init "$BOUNDED" >/dev/null 2>&1
+
+check_output "add-root records a depth bound" "max_depth 1" \
+    "$CLI" add-root "$WORK/tree" --max-depth 1 --goal define \
+        --definition-mode adaptive --store "$BOUNDED"
+
+check_output "roots report their depth bound" "max_depth 1" \
+    "$CLI" roots --store "$BOUNDED"
+
+check_output "a bounded scan says what it did not open" "recorded but not opened" \
+    "$CLI" scan --store "$BOUNDED"
+
+# The point of the whole feature: a bounded scan must not read as an
+# exhaustive one, and the tool must not let it.
+check_output "a bounded scan refuses to imply completeness" \
+    "not a complete reading of the subtree" \
+    "$CLI" scan --store "$BOUNDED"
+
+check_output "grandchildren past the bound are not indexed" "octopus" \
+    sh -c "! $CLI search octopus --store '$BOUNDED' | grep -q d.md && echo octopus-absent"
+
+check_output "children lists a directory's immediate entries" "Alpha" \
+    "$CLI" children "$WORK/tree" --store "$BOUNDED"
+
+check_output "an unopened directory is reported opaque" "opaque" \
+    "$CLI" children "$WORK/tree/Alpha" --store "$BOUNDED"
+
+check_output "coverage reports the requested depth" "max_depth        1" \
+    "$CLI" coverage --store "$BOUNDED"
+
+check_output "coverage separates policy completeness from reading it all" \
+    "does not mean the whole subtree was read" \
+    "$CLI" coverage --store "$BOUNDED"
+
+check_output "observe opens exactly one directory" "directories enumerated  1" \
+    "$CLI" observe "$WORK/tree/Alpha/Deep" --store "$BOUNDED"
+
+check_output "an observed directory yields its contents" "octopus" \
+    sh -c "$CLI search octopus --store '$BOUNDED'"
+
+# Observing Deep must not have expanded anything else on the way. Other sits
+# beside it at the same depth and was equally unopened; it must stay that way.
+check_output "observing one directory does not expand its siblings" "pangolin" \
+    sh -c "! $CLI search pangolin --store '$BOUNDED' | grep -q o.md && echo pangolin-absent"
+
+check_output "an unobserved sibling is still opaque" "opaque" \
+    sh -c "$CLI children '$WORK/tree/Alpha' --store '$BOUNDED' | grep Other"
+
+# A shallow refresh knows nothing about regions it never entered.
+rm "$WORK/tree/Beta/b.md"
+check_output "a shallow refresh marks nothing missing outside its region" \
+    '"sources_marked_missing": 0' \
+    "$CLI" scan --max-depth 0 --json --store "$BOUNDED"
+
+check_output "search results carry the region's coverage" "coverage_manifest_id" \
+    "$CLI" search "top level" --json --store "$BOUNDED"
+
+check_output "info separates files from directories" "directories" \
+    "$CLI" info --store "$BOUNDED"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

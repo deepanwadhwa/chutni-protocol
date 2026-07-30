@@ -1,0 +1,36 @@
+Compatibility: a store forged back to v0.1 shape, then scanned by this build.
+
+$ sqlite3 catalog.sqlite 'SELECT policy_json FROM roots'   # no max_depth, as v0.1 wrote it
+{"recursive":true,"follow_symlinks":false,"include_hidden":false,"retain_deleted_artifacts":true,"max_file_size_bytes":2147483648,"exclude_globs":[]}
+
+$ chutni scan     # absent max_depth MUST mean unbounded, not zero
+Observed 3 directories and 3 files
+  directories enumerated  3  (deepest depth 2)
+  sources indexed         3  (0 already current)
+  listings                3 written, 0 reused
+  text artifacts          3
+  metadata artifacts      3
+  complete for policy     yes
+
+$ chutni search 'deep content'    # the depth-2 file is indexed
+/private/tmp/claude-501/-Users-deepanwadhwa-Documents-chutni-protocol/3417ca45-568f-4bb7-b3c9-eb52b99f425f/scratchpad/compat2/tree/sub/deeper/c.md
+  extracted_text  current  score 1.310
+  deep content
+
+
+$ manifest after the scan
+ spec_version   0.2
+ capabilities   ['sources', 'artifacts', 'provenance', 'full_text_optional', 'hierarchical_sources', 'bounded_coverage', 'directory_definitions']
+ unknown field  {'unknown': 'must survive'}  <- preserved across rewrite
+
+=== directory freshness ===
+$ chutni verify
+
+6 sources: 6 current, 0 stale, 0 missing, 0 other
+$ echo new > tree/sub/new.md ; chutni verify
+stale    /private/tmp/claude-501/-Users-deepanwadhwa-Documents-chutni-protocol/3417ca45-568f-4bb7-b3c9-eb52b99f425f/scratchpad/compat2/tree/sub
+
+6 sources: 5 current, 1 stale, 0 missing, 0 other
+
+The directory is stale because its listing changed; the files inside it
+are untouched and stay current. That is the §13.5 separation working.

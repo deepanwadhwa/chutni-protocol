@@ -1,0 +1,130 @@
+cc -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=1 -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_ENABLE_JSON1 -DCHUTNI_VERSION='"0.2.0"' src/chutni.c src/scan.c src/cj.c third_party/blake3/blake3.c third_party/blake3/blake3_dispatch.c third_party/blake3/blake3_portable.c third_party/sqlite/sqlite3.c tests/conformance/conformance.c \
+	    -o build/san/conformance -lpthread
+cc -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=1 -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_ENABLE_JSON1 -DCHUTNI_VERSION='"0.2.0"' src/chutni.c src/scan.c src/cj.c third_party/blake3/blake3.c third_party/blake3/blake3_dispatch.c third_party/blake3/blake3_portable.c third_party/sqlite/sqlite3.c src/cli.c \
+	    -o build/san/chutni -lpthread
+cc -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=1 -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_ENABLE_JSON1 -DCHUTNI_VERSION='"0.2.0"' src/chutni.c src/scan.c src/cj.c third_party/blake3/blake3.c third_party/blake3/blake3_dispatch.c third_party/blake3/blake3_portable.c third_party/sqlite/sqlite3.c src/mcp.c \
+	    -o build/san/chutni-mcp -lpthread
+Chutni conformance suite — SPEC.md §31 (spec 0.2, library 0.2.0)
+
+  pass  1 minimal valid store                          §8 layout present
+  pass  1 concurrent reader opens while writer is active many readers are allowed
+  pass  1 second writer is refused safely              single-writer coordination
+  pass  1 separate process is refused while writer is active multi-application writer safety
+  pass  1 minimal store reopens                        §30.1 reader
+  pass  2 unknown fields preserved                     §9.1 across rewrite
+  GAP   3 moved-root scenario                          root remapping is not implemented (§26)
+  pass  4 artifact starts current                      current
+  pass  4 changed source detected                      stale
+  pass  4 stale recorded, not just detected            stale
+  pass  4 stale artifact excluded from search          §15.4 active only
+  pass  5 distinct producers get distinct ids          §16.2
+  pass  5 superseded artifact retained                 §23
+  pass  5 superseding artifact active                  §23
+  pass  5 human artifact distinguishable               §23
+  pass  5 provenance names the model                   §16.2
+  pass  5 untraceable model artifact refused           §16.4
+  pass  6 identical payloads share one object          blake3:4595b879a45b4ad0d40522a303596d7441899fda43b3567491be4d83a4f4a821
+  pass  6 stored once, not twice                       objects table
+  pass  6 object round-trips                           
+  pass  7 deleted source reported missing              missing
+  pass  7 missing state persisted                      missing
+  pass  7 artifacts retained after deletion            §24.2 historical memory
+  pass  8 host A contributes PDF page text             host performs extraction; Chutni records it
+  pass  8 host B contributes a separate interpretation append, do not overwrite Host A
+  pass  8 every source keeps base file metadata        file_metadata exists independently of extraction
+  pass  8 App C sees Host A processing provenance      method, producer, selector, and source hash
+  pass  8 App C sees Host B model provenance           claim is preserved, not certified
+  pass  8 producer interpretations coexist             distinct producers remain active
+  pass  8 artifacts and derivations are timestamped    creation history is visible
+  pass  8 wrong source version is refused atomically   integrity validation, not semantic validation
+  pass  9 malformed hash rejected                      
+  pass  9 wrong algorithm rejected                     
+  pass  9 path traversal rejected                      §28.8
+  pass  9 absent object reported not found             
+  pass  9 corrupt object detected on read              content re-hashed
+  pass  10 awkward filenames indexed                   
+  pass  10 awkward filenames resolve back              
+  pass  11 injection text retrievable as data          §6.5
+  pass  11 result attributed to its file               consumer can see the origin
+  pass  12 incompatible representation can be stored   profile remains data, not a global singleton
+  pass  12 representation vector round-trips           serialized f32 object
+  pass  12 incompatible profile is refused             §22.6 exact compatibility gating
+  pass  12 representation list reports compatibility   §17.5 source artifact hash
+  pass  12 semantic search gates and ranks             cosine_bruteforce; incompatible model excluded
+  pass  12 semantic score type is explicit             §19.3
+  pass  13 selected P maps to adjacent P.chutni        §40.2-§40.3
+  pass  13 host B reuses host A artifact               no migration or private schema knowledge
+  pass  13 host A provenance survives handoff          §16
+  pass  13 host B records source change                §13.3, §40.5
+  pass  13 host A reads host B update                  cross-host round trip
+  pass  13 stale host A artifact stays withdrawn       §15.4 current artifacts only
+  pass  13 host B model provenance survives handoff    §16.2, §40.5
+  pass  14 depth zero enumerates only the root         §11.1 root is depth 0
+  pass  14 depth zero records child directories opaque name observed, inside not
+  pass  14 depth zero counts what it did not open      Alpha and Beta
+  pass  14 depth one enumerates immediate children only §11.1 d <= max_depth
+  pass  14 collapsed directory stays explicitly opaque recorded by name, never opened
+  pass  14 directory sources have correct parents      §12.5 parent_source_id is the hierarchy
+  pass  14 root contains its three immediate entries   Alpha, Beta, top.md
+  pass  14 coverage manifest records requested and achieved depth §15.7
+  pass  15 definition without local coverage is refused §15.6
+  pass  15 definition with coverage and stop reason is accepted §15.6
+  pass  15 a consumer can read the definition's local coverage §15.6 stop_reason travels with the claim
+  pass  15 a fresh definition is current               §13.3
+  pass  15 a stale derivation input stales the definition §13.3 second clause; the listing did not change
+  pass  15 unchanged listings are reused               §13.5 same observation, not a new one
+  pass  15 a changed listing changes the directory's observation §13.5 listing hash is the directory's version
+  pass  15 a changed listing stales dependent definitions §13.3
+  pass  16 an unbounded-enough scan reaches the leaves baseline for the shallow refresh
+  pass  16 a shallow refresh does not mark deeper sources missing §24.4 absence is meaningful only inside the covered region
+  pass  16 a shallow refresh does mark its own children missing §24.4 inside the covered region absence is evidence
+  pass  17 the writer advertised hierarchical capabilities §35.1 a consumer can tell this store records coverage
+  pass  17 the consumer reads coverage without having scanned §15.7
+  pass  17 inspected and uninspected directories are distinguishable §12.5
+  pass  17 search results carry hierarchy and coverage §19.3
+  pass  17 contains relations carry provenance         §18
+  pass  17 observed_in ties directories to a scan generation §18, §15.7
+  pass  18 a store that has not used hierarchy does not advertise it §35 write the oldest version that fits
+  pass  18 a missing max_depth means unbounded, not zero §11.1 legacy recursion is preserved
+
+79 passed, 0 failed, 1 gaps
+Gaps are unimplemented scenarios, not passes.
+
+Chutni CLI checks
+
+  pass  discover reports nothing on a fresh machine
+  pass  init creates a store
+  pass  discover finds the new store
+  pass  discover --json is well-formed
+  pass  add-root authorizes a directory
+  pass  scan indexes it
+  pass  search finds indexed content
+  pass  search --json reports a score_type
+  pass  inspect shows provenance
+  pass  verify reports all current
+  pass  empty store refuses to scan without a root
+  pass  edited file is not called current before verify
+  pass  stale content withdrawn after verify
+  pass  rescan picks up new content
+  pass  ambiguous store selection refuses to guess
+  pass  unregister removes a store from discovery
+  pass  add-root records a depth bound
+  pass  roots report their depth bound
+  pass  a bounded scan says what it did not open
+  pass  a bounded scan refuses to imply completeness
+  pass  grandchildren past the bound are not indexed
+  pass  children lists a directory's immediate entries
+  pass  an unopened directory is reported opaque
+  pass  coverage reports the requested depth
+  pass  coverage separates policy completeness from reading it all
+  pass  observe opens exactly one directory
+  pass  an observed directory yields its contents
+  pass  observing one directory does not expand its siblings
+  pass  an unobserved sibling is still opaque
+  pass  a shallow refresh marks nothing missing outside its region
+  pass  search results carry the region's coverage
+  pass  info separates files from directories
+
+32 passed, 0 failed
+
+Chutni MCP checks: 90 passed, 0 failed

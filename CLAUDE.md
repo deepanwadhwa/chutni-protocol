@@ -6,9 +6,11 @@ dependencies to install, no build system beyond `make`.
 
 ## Start here
 
-1. **[SPEC.md](SPEC.md)** is the protocol, version 0.1-draft. It is the source
+1. **[SPEC.md](SPEC.md)** is the protocol, version 0.2-draft. It is the source
    of truth. Section numbers (§8, §13.3, §39) are referenced throughout the
-   code and this document — use them.
+   code and this document — use them. v0.2 added hierarchical sources and
+   bounded coverage (§11.1, §12.5, §13.5, §15.5–§15.7, §24.4, §35.1); v0.1
+   stores stay readable and are not rewritten on open.
 2. **[docs/TASKS.md](docs/TASKS.md)** is what is built, what is not, and what
    to work on next.
 3. **[docs/evidence/](docs/evidence/)** holds test transcripts. Claims about
@@ -30,14 +32,26 @@ make install    # PREFIX=/usr/local
 
 `make test` must be green before anything is called done. It takes ~2 seconds.
 
+**Two versions, deliberately separate.** `VERSION` (currently `0.2.0`) is this
+implementation's release; `CHUTNI_SPEC_VERSION` in `include/chutni.h` (currently
+`0.2`) is the protocol a store is written in. They move independently — a bug
+fix bumps one and not the other. `VERSION` is the single source: the Makefile
+reads it and compiles it in as `CHUTNI_VERSION`, which becomes the library, CLI,
+service, and reference-scanner version. Do not reintroduce a version literal in
+a source file; the scanner's version lands in producer records (§16.1), so a
+stale copy misattributes artifacts to a build that never made them.
+
 ```sh
 chutni discover                      # does memory exist on this computer?
 chutni init ~/Memory.chutni
-chutni add-root ~/Documents
+chutni add-root ~/Documents --max-depth 1 --goal define
 chutni scan
 chutni search "condensation force"
 chutni inspect <path-or-source-id>   # what was derived, and by what
-chutni verify                        # re-hash sources, retire stale artifacts
+chutni children <dir-path-or-id>     # immediate entries; opaque means never opened
+chutni observe <dir-path-or-id>      # enumerate exactly one directory
+chutni coverage                      # what the last scan reached, and what it did not
+chutni verify                        # re-observe sources, retire stale artifacts
 ```
 
 Every command accepts `--json`; agents are the primary consumers.
@@ -46,6 +60,7 @@ Every command accepts `--json`; agents are the primary consumers.
 
 | Path | What |
 |---|---|
+| `VERSION` | the implementation's release version, and the only place it is written |
 | `SPEC.md` | the protocol |
 | `include/chutni.h` | the stable C ABI — the contract other apps bind to |
 | `src/chutni.c` | store, catalog, objects, sources, artifacts, search, discovery |
@@ -102,6 +117,38 @@ Both are covered by regression tests (conformance scenario 4, and the CLI check
 re-read `chutni_source_put`, `chutni_source_refresh`, and
 `chutni_check_freshness` together. They are one mechanism in three places.
 
+v0.2 extended that mechanism rather than duplicating it, and the duplication is
+what to watch for:
+
+- `observe_source` is the single place that re-derives a source's current
+  observation from disk — a file's bytes, or a directory's listing. Nothing
+  else should be reading `sources.content_hash` and calling it the truth.
+- `stale_artifacts_not_matching` is the single place that demotes artifacts
+  bound to a superseded observation. It was inlined twice before v0.2; a third
+  copy for directories is exactly how the two defects above happened.
+- `cascade_stale_dependents` propagates §13.3's second clause: an artifact whose
+  required derivation input is no longer active is describing that input's old
+  content. It runs to a fixpoint, because one pass per verification would leave
+  a chain of derived artifacts half-withdrawn.
+- `chutni_read_directory` is the single place that enumerates, canonicalizes,
+  and hashes a listing. The scanner records one and freshness re-derives it
+  later; if those ever disagreed about which entries a policy admits or how they
+  serialize, every directory in every store would read as permanently stale.
+
+## The second rule v0.2 adds
+
+**Not looking is not the same as finding nothing.** A bounded scan knows only
+about the region it opened. §24.4 makes this normative: reconciliation runs per
+enumerated directory and touches only that directory's own children, so a
+depth-0 refresh can notice a deleted direct child and cannot say anything about
+grandchildren. A directory that was named but never opened is recorded
+`opaque`, and `complete_for_policy` means the requested bounded operation
+finished — never that the subtree was read.
+
+If you add a code path that marks sources missing, prunes, or reports totals,
+ask which region it actually observed. Conformance scenario 16 fails when this
+is got wrong in either direction.
+
 ## Relationship to Samosa
 
 Samosa (`~/Documents/samosa-chat`) has a sidecar also called Chutni. **It is a
@@ -114,6 +161,8 @@ different, earlier, incompatible design** and predates this protocol:
 | Tables | `files`, `contents`, `chunks`, `memory_cards`, … | `roots`, `sources`, `objects`, `producers`, `derivations`, `artifacts`, … |
 | Provenance | fingerprint columns | per-artifact `producers` + `derivations` (§6.4) |
 | Discovery | none | §39 |
+| Hierarchy | path strings on file rows | directory sources + `parent_source_id` (§12.5) |
+| Coverage | not represented | bounded depth + coverage manifests (§11.1, §15.7) |
 
 **Neither can read the other. Samosa is not Chutni-compatible**, and must not
 be described as such until conversion work exists and has been run on a real

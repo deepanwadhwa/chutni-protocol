@@ -1,6 +1,6 @@
 /* Chutni reference implementation — store, catalog, objects, search, discovery.
  *
- * Specification: SPEC.md (version 0.1). Section references in comments point
+ * Specification: SPEC.md (version 0.2). Section references in comments point
  * there.
  */
 #define _POSIX_C_SOURCE 200809L
@@ -27,7 +27,15 @@
 #include "blake3.h"
 #include "sqlite3.h"
 
-#define CHUTNI_LIB_VERSION "0.1.0"
+/* The implementation's release version comes from the VERSION file via the
+ * Makefile. The fallback keeps a hand-rolled compile working without it, and says
+ * plainly that it does not know the version rather than naming one it cannot
+ * vouch for — this string ends up in producer records (§16.1). */
+#ifndef CHUTNI_VERSION
+#define CHUTNI_VERSION "0.0.0-unversioned"
+#endif
+
+#define CHUTNI_LIB_VERSION CHUTNI_VERSION
 #define ERRBUF 512
 
 struct chutni_store {
@@ -374,6 +382,8 @@ static const char *SCHEMA_SQL =
 "CREATE INDEX IF NOT EXISTS idx_sources_path ON sources(json_extract(locator_json,'$.display_path'));"
 "CREATE INDEX IF NOT EXISTS idx_sources_hash ON sources(content_hash);"
 "CREATE INDEX IF NOT EXISTS idx_sources_root ON sources(root_id);"
+"CREATE INDEX IF NOT EXISTS idx_sources_parent ON sources(parent_source_id);"
+"CREATE INDEX IF NOT EXISTS idx_sources_kind ON sources(source_kind);"
 "CREATE INDEX IF NOT EXISTS idx_artifacts_source ON artifacts(source_id);"
 "CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(artifact_kind, status);"
 "CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_id);"
@@ -837,6 +847,12 @@ void chutni_root_policy_defaults(chutni_root_policy *p) {
     p->retain_deleted_artifacts = 1;
     p->max_file_size_bytes = 2147483648ull;
     p->exclude_globs = NULL;
+    /* §11.1: unbounded is the v0.1 behavior, and defaults must not silently
+       change what an existing caller's scan covers. A host that wants a
+       bounded scan says so. */
+    p->max_depth = CHUTNI_DEPTH_UNBOUNDED;
+    p->memory_goal = NULL;
+    p->definition_mode = NULL;
 }
 
 static char *policy_to_json(const chutni_root_policy *p) {
@@ -851,9 +867,45 @@ static char *policy_to_json(const chutni_root_policy *p) {
     if (p->exclude_globs)
         for (const char *const *g = p->exclude_globs; *g; g++) cj_push(globs, cj_str(*g));
     cj_set(o, "exclude_globs", globs);
+    /* Explicit null rather than an omitted key: a reader can then tell a policy
+       that considered depth and chose unbounded from a v0.1 policy that never
+       had the concept. Both mean unbounded; only one of them said so. */
+    cj_set(o, "max_depth", p->max_depth < 0 ? cj_null() : cj_num((double)p->max_depth));
+    if (p->memory_goal) cj_set(o, "memory_goal", cj_str(p->memory_goal));
+    if (p->definition_mode) cj_set(o, "definition_mode", cj_str(p->definition_mode));
     char *text = cj_dump(o, -1);
     cj_free(o);
     return text;
+}
+
+/* §35.1: a store that records hierarchy must say so, because a consumer cannot
+   distinguish "this tree has no subdirectories" from "this writer never looked"
+   without being told which one it is reading. Idempotent. */
+static void advertise_hierarchy(chutni_store *s) {
+    if (!s || s->read_only || !s->manifest) return;
+    static const char *wanted[] = { "hierarchical_sources", "bounded_coverage",
+                                    "directory_definitions", NULL };
+    cj *caps = cj_get(s->manifest, "capabilities");
+    if (!caps || caps->type != CJ_ARR) {
+        caps = cj_arr();
+        if (!caps || !cj_set(s->manifest, "capabilities", caps)) return;
+    }
+    int changed = 0;
+    for (const char **w = wanted; *w; w++) {
+        int present = 0;
+        for (size_t i = 0; i < caps->n; i++)
+            if (caps->items[i]->type == CJ_STR && caps->items[i]->str &&
+                !strcmp(caps->items[i]->str, *w)) { present = 1; break; }
+        if (!present && cj_push(caps, cj_str(*w))) changed = 1;
+    }
+    /* Writers record the oldest version that describes what they used (§35).
+       Hierarchy is a 0.2 feature, so using it moves the store to 0.2. */
+    const char *sv = cj_get_str(s->manifest, "spec_version");
+    if (!sv || strcmp(sv, CHUTNI_SPEC_VERSION)) {
+        cj_set(s->manifest, "spec_version", cj_str(CHUTNI_SPEC_VERSION));
+        changed = 1;
+    }
+    if (changed) manifest_save(s);
 }
 
 static char *locator_json_for(const char *abs_path) {
@@ -975,22 +1027,24 @@ void chutni_root_info_free(chutni_root_info *roots, size_t count) {
     free(roots);
 }
 
-chutni_status chutni_sources_list(chutni_store *s, const char *root_id,
-                                  chutni_source_info **out, size_t *count) {
-    if (!s || !out || !count) return CHUTNI_ERR_INVALID;
+/* Every source listing returns the same ten columns in the same order, so that
+   hierarchy fields cannot be present on one path and quietly absent on
+   another. `bind` is bound to ?1 when non-NULL. */
+#define SOURCE_COLUMNS \
+    "SELECT source_id, json_extract(locator_json,'$.display_path'), media_type," \
+    " content_hash, state, COALESCE(size_bytes,0), source_kind, parent_source_id," \
+    " json_extract(metadata_json,'$.observation')," \
+    " COALESCE(json_extract(metadata_json,'$.depth'),-1) FROM sources "
+
+static chutni_status sources_query(chutni_store *s, const char *sql,
+                                   const char *bind, chutni_source_info **out,
+                                   size_t *count) {
     *out = NULL;
     *count = 0;
-    const char *sql = root_id
-        ? "SELECT source_id, json_extract(locator_json,'$.display_path'), media_type,"
-          " content_hash, state, COALESCE(size_bytes,0) FROM sources WHERE root_id=?1"
-          " ORDER BY json_extract(locator_json,'$.display_path')"
-        : "SELECT source_id, json_extract(locator_json,'$.display_path'), media_type,"
-          " content_hash, state, COALESCE(size_bytes,0) FROM sources"
-          " ORDER BY json_extract(locator_json,'$.display_path')";
     sqlite3_stmt *q = NULL;
     if (sqlite3_prepare_v2(s->db, sql, -1, &q, NULL) != SQLITE_OK)
         return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
-    if (root_id) sqlite3_bind_text(q, 1, root_id, -1, SQLITE_TRANSIENT);
+    if (bind) sqlite3_bind_text(q, 1, bind, -1, SQLITE_TRANSIENT);
     chutni_source_info *vec = NULL;
     size_t n = 0, cap = 0;
     while (sqlite3_step(q) == SQLITE_ROW) {
@@ -1001,18 +1055,33 @@ chutni_status chutni_sources_list(chutni_store *s, const char *root_id,
             vec = t;
             cap = c;
         }
-        vec[n].source_id    = dup_col(q, 0);
-        vec[n].display_path = dup_col(q, 1);
-        vec[n].media_type   = dup_col(q, 2);
-        vec[n].content_hash = dup_col(q, 3);
-        vec[n].state        = dup_col(q, 4);
-        vec[n].size_bytes   = sqlite3_column_int64(q, 5);
+        vec[n].source_id        = dup_col(q, 0);
+        vec[n].display_path     = dup_col(q, 1);
+        vec[n].media_type       = dup_col(q, 2);
+        vec[n].content_hash     = dup_col(q, 3);
+        vec[n].state            = dup_col(q, 4);
+        vec[n].size_bytes       = sqlite3_column_int64(q, 5);
+        vec[n].source_kind      = dup_col(q, 6);
+        vec[n].parent_source_id = dup_col(q, 7);
+        vec[n].observation      = dup_col(q, 8);
+        vec[n].depth            = sqlite3_column_int(q, 9);
         n++;
     }
     sqlite3_finalize(q);
     *out = vec;
     *count = n;
     return CHUTNI_OK;
+}
+
+chutni_status chutni_sources_list(chutni_store *s, const char *root_id,
+                                  chutni_source_info **out, size_t *count) {
+    if (!s || !out || !count) return CHUTNI_ERR_INVALID;
+    return sources_query(s,
+        root_id ? SOURCE_COLUMNS "WHERE root_id=?1"
+                  " ORDER BY json_extract(locator_json,'$.display_path')"
+                : SOURCE_COLUMNS
+                  " ORDER BY json_extract(locator_json,'$.display_path')",
+        root_id, out, count);
 }
 
 void chutni_source_info_free(chutni_source_info *sources, size_t count) {
@@ -1023,6 +1092,9 @@ void chutni_source_info_free(chutni_source_info *sources, size_t count) {
         free(sources[i].media_type);
         free(sources[i].content_hash);
         free(sources[i].state);
+        free(sources[i].source_kind);
+        free(sources[i].parent_source_id);
+        free(sources[i].observation);
     }
     free(sources);
 }
@@ -1178,6 +1250,16 @@ chutni_status chutni_store_counts(chutni_store *s, chutni_counts *c) {
     c->artifacts_stale      = scalar(s, "SELECT COUNT(*) FROM artifacts WHERE status='stale'");
     c->artifacts_superseded = scalar(s, "SELECT COUNT(*) FROM artifacts WHERE status='superseded'");
     c->object_bytes = scalar(s, "SELECT COALESCE(SUM(size_bytes),0) FROM objects");
+    /* Sources predating hierarchical scanning have no source_kind of their
+       own; they were files, so count them as files rather than dropping them. */
+    c->sources_files = scalar(s,
+        "SELECT COUNT(*) FROM sources WHERE COALESCE(source_kind,'file')='file'");
+    c->sources_directories = scalar(s,
+        "SELECT COUNT(*) FROM sources WHERE source_kind='directory'");
+    c->sources_opaque_directories = scalar(s,
+        "SELECT COUNT(*) FROM sources WHERE source_kind='directory'"
+        " AND json_extract(metadata_json,'$.observation')='opaque'");
+    c->relations = scalar(s, "SELECT COUNT(*) FROM relations");
     return CHUTNI_OK;
 }
 
@@ -1375,6 +1457,284 @@ static const char *media_type_for(const char *path) {
     return "application/octet-stream";
 }
 
+/* -------------------------------------------------- directory observation
+ *
+ * §13.5. A directory has no bytes to hash, so what identifies it is one
+ * observed immediate listing: the names it held and what kind each one was.
+ *
+ * The listing deliberately excludes file contents. A file changing inside a
+ * directory does not change the directory's membership, and folding content
+ * hashes in here would make every edit anywhere invalidate every enclosing
+ * listing up to the root. Content changes reach a directory's definition
+ * through derivation inputs instead (§13.3), which is the path that can say
+ * which input went stale.
+ *
+ * Media types are also excluded. They are derived from the name by a table
+ * this implementation may extend, and a listing hash that moved when that
+ * table grew would stale every directory in every store on upgrade.
+ */
+
+/* Names the reference implementation never descends into. This is a fixed
+ * list, not policy_json's exclude_globs, which remains unenforced — see
+ * docs/TASKS.md. A caller that needs different exclusions cannot express them
+ * yet, and pretending otherwise would put a policy field in a listing hash
+ * that nothing actually consults. */
+static int excluded_entry_name(const char *name) {
+    static const char *skip[] = {
+        ".git", ".svn", ".hg", "node_modules", ".cache", "__pycache__",
+        ".venv", "venv", "target", ".Trash", NULL
+    };
+    for (const char **p = skip; *p; p++)
+        if (!strcmp(name, *p)) return 1;
+    return 0;
+}
+
+static int dir_entry_cmp(const void *a, const void *b) {
+    const chutni_dir_entry *x = a, *y = b;
+    return strcmp(x->name, y->name);
+}
+
+/* Escapes so that a name containing a tab or a newline cannot forge an entry
+ * boundary. POSIX permits both in filenames, and a listing hash that two
+ * different directories could collide on is not an identity. */
+static void append_escaped(char **buf, size_t *len, size_t *cap, const char *s) {
+    for (const char *p = s; *p; p++) {
+        char out[2];
+        size_t n = 1;
+        switch (*p) {
+            case '\\': out[0] = '\\'; out[1] = '\\'; n = 2; break;
+            case '\t': out[0] = '\\'; out[1] = 't';  n = 2; break;
+            case '\n': out[0] = '\\'; out[1] = 'n';  n = 2; break;
+            case '\r': out[0] = '\\'; out[1] = 'r';  n = 2; break;
+            default:   out[0] = *p; break;
+        }
+        if (*len + n + 1 > *cap) {
+            size_t c = *cap ? *cap * 2 : 256;
+            while (c < *len + n + 1) c *= 2;
+            char *t = realloc(*buf, c);
+            if (!t) return;
+            *buf = t;
+            *cap = c;
+        }
+        memcpy(*buf + *len, out, n);
+        *len += n;
+        (*buf)[*len] = 0;
+    }
+}
+
+static void append_raw(char **buf, size_t *len, size_t *cap, const char *s) {
+    size_t n = strlen(s);
+    if (*len + n + 1 > *cap) {
+        size_t c = *cap ? *cap * 2 : 256;
+        while (c < *len + n + 1) c *= 2;
+        char *t = realloc(*buf, c);
+        if (!t) return;
+        *buf = t;
+        *cap = c;
+    }
+    memcpy(*buf + *len, s, n);
+    *len += n;
+    (*buf)[*len] = 0;
+}
+
+void chutni_dir_entry_free(chutni_dir_entry *entries, size_t count) {
+    if (!entries) return;
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].name);
+        free(entries[i].source_kind);
+        free(entries[i].media_type);
+    }
+    free(entries);
+}
+
+chutni_status chutni_read_directory(const char *dir,
+                                    const chutni_root_policy *policy,
+                                    chutni_dir_entry **out, size_t *count,
+                                    uint64_t *excluded, uint64_t *unsupported,
+                                    char hash_out[CHUTNI_HASH_STRLEN]) {
+    if (!dir) return CHUTNI_ERR_INVALID;
+    if (out) *out = NULL;
+    if (count) *count = 0;
+
+    chutni_root_policy defaults;
+    if (!policy) { chutni_root_policy_defaults(&defaults); policy = &defaults; }
+
+    DIR *d = opendir(dir);
+    if (!d) return CHUTNI_ERR_IO;
+
+    chutni_dir_entry *vec = NULL;
+    size_t n = 0, cap = 0;
+    uint64_t skipped = 0, odd = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (e->d_name[0] == '.' && !policy->include_hidden) { skipped++; continue; }
+        if (excluded_entry_name(e->d_name)) { skipped++; continue; }
+
+        char full[PATH_MAX];
+        if ((size_t)snprintf(full, sizeof full, "%s/%s", dir, e->d_name) >= sizeof full) {
+            odd++;
+            continue;
+        }
+        struct stat st;
+        if (lstat(full, &st) != 0) { odd++; continue; }
+        if (S_ISLNK(st.st_mode)) {
+            if (!policy->follow_symlinks) { skipped++; continue; }
+            if (stat(full, &st) != 0) { odd++; continue; }
+        }
+        int is_directory = S_ISDIR(st.st_mode) != 0;
+        if (!is_directory && !S_ISREG(st.st_mode)) { odd++; continue; }
+
+        if (n == cap) {
+            size_t c = cap ? cap * 2 : 32;
+            chutni_dir_entry *t = realloc(vec, c * sizeof *t);
+            if (!t) break;
+            vec = t;
+            cap = c;
+        }
+        memset(&vec[n], 0, sizeof vec[n]);
+        vec[n].name = strdup(e->d_name);
+        vec[n].source_kind = strdup(is_directory ? "directory" : "file");
+        vec[n].media_type = is_directory ? NULL : strdup(media_type_for(e->d_name));
+        vec[n].size_bytes = is_directory ? -1 : (int64_t)st.st_size;
+        if (!vec[n].name || !vec[n].source_kind) {
+            chutni_dir_entry_free(vec, n + 1);
+            closedir(d);
+            return CHUTNI_ERR_NOMEM;
+        }
+        n++;
+    }
+    closedir(d);
+
+    /* Readdir order is not defined and differs between filesystems, so the
+       canonical form sorts. Two computers observing the same directory must
+       compute the same hash or freshness means nothing across a copied store. */
+    if (vec) qsort(vec, n, sizeof *vec, dir_entry_cmp);
+
+    if (hash_out) {
+        char *buf = NULL;
+        size_t len = 0, bcap = 0;
+        append_raw(&buf, &len, &bcap, "chutni-listing-1\n");
+        for (size_t i = 0; i < n; i++) {
+            append_escaped(&buf, &len, &bcap, vec[i].name);
+            append_raw(&buf, &len, &bcap, "\t");
+            append_raw(&buf, &len, &bcap, vec[i].source_kind);
+            append_raw(&buf, &len, &bcap, "\n");
+        }
+        if (!buf) {
+            chutni_dir_entry_free(vec, n);
+            return CHUTNI_ERR_NOMEM;
+        }
+        chutni_status hs = chutni_hash_bytes(buf, len, hash_out);
+        free(buf);
+        if (hs != CHUTNI_OK) {
+            chutni_dir_entry_free(vec, n);
+            return hs;
+        }
+    }
+
+    if (excluded) *excluded = skipped;
+    if (unsupported) *unsupported = odd;
+    if (out) { *out = vec; if (count) *count = n; }
+    else chutni_dir_entry_free(vec, n);
+    return CHUTNI_OK;
+}
+
+chutni_status chutni_directory_listing_hash(const char *dir,
+                                            const chutni_root_policy *policy,
+                                            char hash_out[CHUTNI_HASH_STRLEN]) {
+    if (!dir || !hash_out) return CHUTNI_ERR_INVALID;
+    return chutni_read_directory(dir, policy, NULL, NULL, NULL, NULL, hash_out);
+}
+
+/* The policy a source's root was authorized under. Freshness must re-enumerate
+   under the same rules the scan used, or it re-derives a different listing and
+   calls every directory stale. */
+static void policy_for_source(chutni_store *s, const char *source_id,
+                              chutni_root_policy *out) {
+    chutni_root_policy_defaults(out);
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT r.policy_json FROM sources sc JOIN roots r ON r.root_id=sc.root_id"
+            " WHERE sc.source_id=?1", -1, &q, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+    char json[4096] = "";
+    if (sqlite3_step(q) == SQLITE_ROW) {
+        const unsigned char *p = sqlite3_column_text(q, 0);
+        if (p) snprintf(json, sizeof json, "%s", (const char *)p);
+    }
+    sqlite3_finalize(q);
+    if (!json[0]) return;
+    cj *o = cj_parse(json, NULL);
+    if (!o) return;
+    cj *v = cj_get(o, "follow_symlinks");
+    if (v && v->type == CJ_BOOL) out->follow_symlinks = v->bval;
+    v = cj_get(o, "include_hidden");
+    if (v && v->type == CJ_BOOL) out->include_hidden = v->bval;
+    cj_free(o);
+}
+
+/* §13.3, applied to whatever a source's current version happens to be: a
+   file's bytes, or a directory's observed listing. One rule, one place — the
+   two defects this format exists to prevent were both freshness logic that had
+   drifted apart between copies. */
+static void stale_artifacts_not_matching(chutni_store *s, const char *source_id,
+                                         const char *hash, const char *now) {
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "UPDATE artifacts SET status='stale', updated_at=?3"
+            " WHERE source_id=?1 AND status='active' AND source_content_hash IS NOT NULL"
+            " AND source_content_hash<>?2", -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 2, hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 3, now, -1, SQLITE_TRANSIENT);
+        sqlite3_step(q);
+        sqlite3_finalize(q);
+    }
+    /* The lexical index indexes active artifacts only. */
+    if (s->have_index &&
+        sqlite3_prepare_v2(s->db,
+            "DELETE FROM idx.artifacts_fts WHERE artifact_id IN"
+            " (SELECT artifact_id FROM artifacts WHERE source_id=?1 AND status<>'active')",
+            -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+        sqlite3_step(q);
+        sqlite3_finalize(q);
+    }
+}
+
+/* §13.3 second clause: an artifact whose derivation required an input that is
+   no longer active is describing that input's old content, whatever its own
+   source looks like. Repeats to a fixpoint so a chain of derived artifacts
+   withdraws all the way down, not one level per verification pass. */
+static void cascade_stale_dependents(chutni_store *s, const char *now) {
+    for (int round = 0; round < 16; round++) {
+        sqlite3_stmt *q = NULL;
+        if (sqlite3_prepare_v2(s->db,
+                "UPDATE artifacts SET status='stale', updated_at=?1"
+                " WHERE status='active' AND derivation_id IN ("
+                "   SELECT d.derivation_id FROM derivations d, json_each(d.input_refs_json) je"
+                "   JOIN artifacts inp"
+                "     ON inp.artifact_id = json_extract(je.value,'$.artifact_id')"
+                "   WHERE json_valid(d.input_refs_json)"
+                "     AND json_type(je.value)='object'"
+                "     AND COALESCE(json_extract(je.value,'$.required'), 1) NOT IN (0,'false')"
+                "     AND inp.status<>'active')",
+                -1, &q, NULL) != SQLITE_OK)
+            return;
+        sqlite3_bind_text(q, 1, now, -1, SQLITE_TRANSIENT);
+        sqlite3_step(q);
+        int changed = sqlite3_changes(s->db);
+        sqlite3_finalize(q);
+        if (!changed) return;
+        /* The lexical index carries active artifacts only, so anything this
+           round demoted has to leave it. */
+        if (s->have_index)
+            sql_exec(s, "DELETE FROM idx.artifacts_fts WHERE artifact_id IN"
+                        " (SELECT artifact_id FROM artifacts WHERE status<>'active')");
+    }
+}
+
 chutni_status chutni_source_put(chutni_store *s, const char *root_id, const char *path,
                                 int hash_file, char source_id[CHUTNI_ID_STRLEN], int *changed) {
     if (!s || !path || !source_id) return CHUTNI_ERR_INVALID;
@@ -1465,26 +1825,8 @@ chutni_status chutni_source_put(chutni_store *s, const char *root_id, const char
        being current. They are marked stale rather than deleted, so provenance
        and history survive. */
     if (content_hash[0] && prev_id[0] && prev_hash[0] && strcmp(prev_hash, content_hash)) {
-        if (sqlite3_prepare_v2(s->db,
-                "UPDATE artifacts SET status='stale', updated_at=?3"
-                " WHERE source_id=?1 AND status='active' AND source_content_hash IS NOT NULL"
-                " AND source_content_hash<>?2", -1, &q, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(q, 2, content_hash, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(q, 3, now, -1, SQLITE_TRANSIENT);
-            sqlite3_step(q);
-            sqlite3_finalize(q);
-        }
-        /* The lexical index indexes active artifacts only. */
-        if (s->have_index &&
-            sqlite3_prepare_v2(s->db,
-                "DELETE FROM idx.artifacts_fts WHERE artifact_id IN"
-                " (SELECT artifact_id FROM artifacts WHERE source_id=?1 AND status<>'active')",
-                -1, &q, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
-            sqlite3_step(q);
-            sqlite3_finalize(q);
-        }
+        stale_artifacts_not_matching(s, source_id, content_hash, now);
+        cascade_stale_dependents(s, now);
     }
 
     /* What a caller means by "changed" is "does this still need extracting?",
@@ -1511,6 +1853,163 @@ chutni_status chutni_source_put(chutni_store *s, const char *root_id, const char
     return CHUTNI_OK;
 }
 
+/* Merge hierarchy facts into a source without disturbing metadata_json keys
+   this implementation did not write (§9.1 applies to source metadata too). */
+static void source_set_hierarchy(chutni_store *s, const char *source_id,
+                                 const char *parent_source_id, int depth,
+                                 const char *observation) {
+    sqlite3_stmt *q = NULL;
+    char existing[4096] = "";
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT COALESCE(metadata_json,'') FROM sources WHERE source_id=?1",
+            -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(q) == SQLITE_ROW)
+            snprintf(existing, sizeof existing, "%s",
+                     (const char *)sqlite3_column_text(q, 0));
+        sqlite3_finalize(q);
+    }
+    cj *meta = existing[0] ? cj_parse(existing, NULL) : NULL;
+    if (!meta || meta->type != CJ_OBJ) { cj_free(meta); meta = cj_obj(); }
+    if (!meta) return;
+    if (depth >= 0) cj_set(meta, "depth", cj_num((double)depth));
+    if (observation) cj_set(meta, "observation", cj_str(observation));
+    char *text = cj_dump(meta, -1);
+    cj_free(meta);
+    if (!text) return;
+
+    if (sqlite3_prepare_v2(s->db,
+            "UPDATE sources SET parent_source_id=COALESCE(?2,parent_source_id),"
+            " metadata_json=?3 WHERE source_id=?1", -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+        bind_text_or_null(q, 2, parent_source_id);
+        sqlite3_bind_text(q, 3, text, -1, SQLITE_TRANSIENT);
+        sqlite3_step(q);
+        sqlite3_finalize(q);
+    }
+    free(text);
+}
+
+chutni_status chutni_directory_put(chutni_store *s, const char *root_id,
+                                   const char *path,
+                                   const char *parent_source_id,
+                                   const char *listing_hash, int depth,
+                                   char source_id[CHUTNI_ID_STRLEN]) {
+    if (!s || !path || !source_id) return CHUTNI_ERR_INVALID;
+    if (s->read_only) return fail(s, CHUTNI_ERR_READONLY, "store is read-only");
+    if (listing_hash && !hash_is_valid(listing_hash))
+        return fail(s, CHUTNI_ERR_INVALID, "listing hash is malformed");
+
+    char abs[PATH_MAX];
+    if (!abspath_of(path, abs))
+        return fail(s, CHUTNI_ERR_NOTFOUND, "no such directory: %s", path);
+    struct stat st;
+    if (lstat(abs, &st) != 0)
+        return fail(s, CHUTNI_ERR_NOTFOUND, "cannot stat %s", abs);
+    if (!is_dir(abs))
+        return fail(s, CHUTNI_ERR_INVALID, "not a directory: %s", abs);
+
+    char prev_id[CHUTNI_ID_STRLEN], prev_hash[CHUTNI_HASH_STRLEN];
+    prev_id[0] = prev_hash[0] = 0;
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT source_id, COALESCE(content_hash,'') FROM sources"
+            " WHERE json_extract(locator_json,'$.display_path')=?1",
+            -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, abs, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            snprintf(prev_id, sizeof prev_id, "%s", (const char *)sqlite3_column_text(q, 0));
+            snprintf(prev_hash, sizeof prev_hash, "%s", (const char *)sqlite3_column_text(q, 1));
+        }
+        sqlite3_finalize(q);
+    }
+
+    char now[32];
+    iso_now(now);
+    char *loc = locator_json_for(abs);
+    if (!loc) return CHUTNI_ERR_NOMEM;
+    cj *ident = cj_obj();
+    cj_set(ident, "posix_dev", cj_num((double)st.st_dev));
+    cj_set(ident, "posix_ino", cj_num((double)st.st_ino));
+    char *ident_json = cj_dump(ident, -1);
+    cj_free(ident);
+
+    const char *base = strrchr(abs, '/');
+    base = base && base[1] ? base + 1 : abs;
+    long long mtime_ns = stat_mtime_ns(&st);
+
+    if (prev_id[0]) {
+        snprintf(source_id, CHUTNI_ID_STRLEN, "%s", prev_id);
+        /* An opaque re-observation must not erase a listing recorded earlier:
+           not looking inside is not evidence that the inside changed. */
+        if (sqlite3_prepare_v2(s->db,
+                "UPDATE sources SET root_id=COALESCE(?2,root_id), source_kind='directory',"
+                " locator_json=?3, display_name=?4, media_type=NULL, size_bytes=NULL,"
+                " content_hash=COALESCE(?5,content_hash), mtime_ns=?6, file_identity_json=?7,"
+                " state='present', last_seen_at=?8, last_scanned_at=?8 WHERE source_id=?1",
+                -1, &q, NULL) != SQLITE_OK) {
+            free(loc); free(ident_json);
+            return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+        }
+    } else {
+        if (!uuid7(source_id)) { free(loc); free(ident_json); return fail(s, CHUTNI_ERR_IO, "no entropy"); }
+        if (sqlite3_prepare_v2(s->db,
+                "INSERT INTO sources(source_id,root_id,source_kind,locator_json,display_name,"
+                "media_type,size_bytes,content_hash,mtime_ns,file_identity_json,state,"
+                "first_seen_at,last_seen_at,last_scanned_at)"
+                " VALUES(?1,?2,'directory',?3,?4,NULL,NULL,?5,?6,?7,'present',?8,?8,?8)",
+                -1, &q, NULL) != SQLITE_OK) {
+            free(loc); free(ident_json);
+            return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+        }
+    }
+    sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+    bind_text_or_null(q, 2, root_id);
+    sqlite3_bind_text(q, 3, loc, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 4, base, -1, SQLITE_TRANSIENT);
+    bind_text_or_null(q, 5, listing_hash);
+    sqlite3_bind_int64(q, 6, mtime_ns);
+    sqlite3_bind_text(q, 7, ident_json ? ident_json : "{}", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 8, now, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(q);
+    sqlite3_finalize(q);
+    free(loc);
+    free(ident_json);
+    if (rc != SQLITE_DONE) return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+
+    if (listing_hash && prev_hash[0] && strcmp(prev_hash, listing_hash))
+        stale_artifacts_not_matching(s, source_id, listing_hash, now);
+
+    source_set_hierarchy(s, source_id, parent_source_id, depth,
+                         listing_hash ? "enumerated" : "opaque");
+    advertise_hierarchy(s);
+    return CHUTNI_OK;
+}
+
+chutni_status chutni_list_children(chutni_store *s, const char *source_id,
+                                   chutni_source_info **out, size_t *count) {
+    if (!s || !source_id || !out || !count) return CHUTNI_ERR_INVALID;
+    return sources_query(s, SOURCE_COLUMNS
+                            "WHERE parent_source_id=?1 ORDER BY display_name",
+                         source_id, out, count);
+}
+
+chutni_status chutni_source_set_parent(chutni_store *s, const char *source_id,
+                                       const char *parent_source_id, int depth) {
+    if (!s || !source_id) return CHUTNI_ERR_INVALID;
+    if (s->read_only) return fail(s, CHUTNI_ERR_READONLY, "store is read-only");
+    if (parent_source_id && !strcmp(parent_source_id, source_id))
+        return fail(s, CHUTNI_ERR_INVALID, "a source cannot contain itself");
+    source_set_hierarchy(s, source_id, parent_source_id, depth, NULL);
+    advertise_hierarchy(s);
+    return CHUTNI_OK;
+}
+
+chutni_status chutni_new_id(char id[CHUTNI_ID_STRLEN]) {
+    if (!id) return CHUTNI_ERR_INVALID;
+    return uuid7(id) ? CHUTNI_OK : CHUTNI_ERR_IO;
+}
+
 chutni_status chutni_source_set_state(chutni_store *s, const char *source_id,
                                       chutni_source_state state) {
     if (!s || !source_id) return CHUTNI_ERR_INVALID;
@@ -1532,71 +2031,174 @@ chutni_status chutni_source_set_state(chutni_store *s, const char *source_id,
     return rows ? CHUTNI_OK : CHUTNI_ERR_NOTFOUND;
 }
 
+/* Re-derive a source's current observation from the filesystem.
+ *
+ * Never from the catalog. Both defects found while building v0.1 came from
+ * comparing one piece of catalog state against another and finding, correctly,
+ * that they agreed — while the disk said something else entirely. A file's
+ * observation is the hash of its bytes; an enumerated directory's is the hash
+ * of its listing, re-read here rather than remembered.
+ *
+ * Returns 0 and sets *state when there is nothing to compare against. */
+static int observe_source(chutni_store *s, const char *source_id,
+                          char out[CHUTNI_HASH_STRLEN], const char **state) {
+    sqlite3_stmt *q = NULL;
+    char kind[32] = "", path[PATH_MAX] = "", observation[32] = "";
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT COALESCE(source_kind,'file'),"
+            " json_extract(locator_json,'$.display_path'),"
+            " COALESCE(json_extract(metadata_json,'$.observation'),'')"
+            " FROM sources WHERE source_id=?1", -1, &q, NULL) != SQLITE_OK) {
+        *state = "unknown";
+        return 0;
+    }
+    sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+    int found = sqlite3_step(q) == SQLITE_ROW;
+    if (found) {
+        snprintf(kind, sizeof kind, "%s", (const char *)sqlite3_column_text(q, 0));
+        const unsigned char *p = sqlite3_column_text(q, 1);
+        snprintf(path, sizeof path, "%s", p ? (const char *)p : "");
+        snprintf(observation, sizeof observation, "%s",
+                 (const char *)sqlite3_column_text(q, 2));
+    }
+    sqlite3_finalize(q);
+    if (!found || !path[0]) { *state = "unknown"; return 0; }
+    if (access(path, R_OK) != 0) { *state = "missing"; return 0; }
+
+    if (!strcmp(kind, "directory")) {
+        if (!is_dir(path)) { *state = "missing"; return 0; }
+        /* An opaque directory was never opened, so the only thing ever claimed
+           about it is that it is there — and it is. Re-enumerating to check
+           would open a directory the policy said not to open (§11.1). */
+        if (!strcmp(observation, "opaque")) { *state = "current"; return 0; }
+        chutni_root_policy policy;
+        policy_for_source(s, source_id, &policy);
+        if (chutni_directory_listing_hash(path, &policy, out) != CHUTNI_OK) {
+            *state = "unreadable";
+            return 0;
+        }
+        return 1;
+    }
+    if (chutni_hash_file(path, out) != CHUTNI_OK) { *state = "unreadable"; return 0; }
+    return 1;
+}
+
+static chutni_status artifact_freshness(chutni_store *s, const char *artifact_id,
+                                        int depth, const char **out_state);
+
+/* §13.3, second clause. A derived artifact is a claim about its inputs as much
+   as about its source: a directory definition written from three child
+   summaries is describing those summaries, so if one of them no longer
+   describes anything real, neither does the definition. */
+static int derivation_inputs_current(chutni_store *s, const char *artifact_id,
+                                     int depth, const char **out_state) {
+    char refs[8192] = "";
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT COALESCE(d.input_refs_json,'[]') FROM artifacts a"
+            " JOIN derivations d ON d.derivation_id=a.derivation_id"
+            " WHERE a.artifact_id=?1", -1, &q, NULL) != SQLITE_OK) return 1;
+    sqlite3_bind_text(q, 1, artifact_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(q) == SQLITE_ROW)
+        snprintf(refs, sizeof refs, "%s", (const char *)sqlite3_column_text(q, 0));
+    sqlite3_finalize(q);
+    if (!refs[0]) return 1;
+
+    cj *list = cj_parse(refs, NULL);
+    if (!list || list->type != CJ_ARR) { cj_free(list); return 1; }
+    int all_current = 1;
+    for (size_t i = 0; i < list->n && all_current; i++) {
+        cj *entry = list->items[i];
+        if (!entry || entry->type != CJ_OBJ) continue;
+        const char *input = cj_get_str(entry, "artifact_id");
+        if (!input) continue;
+        cj *required = cj_get(entry, "required");
+        if (required && required->type == CJ_BOOL && !required->bval) continue;
+        const char *input_state = "unknown";
+        artifact_freshness(s, input, depth + 1, &input_state);
+        if (strcmp(input_state, "current")) {
+            all_current = 0;
+            /* Report the input's condition rather than a generic "stale", so a
+               host can tell a vanished input from a rewritten one. */
+            *out_state = !strcmp(input_state, "missing") ? "missing" : "stale";
+        }
+    }
+    cj_free(list);
+    return all_current;
+}
+
+static chutni_status artifact_freshness(chutni_store *s, const char *artifact_id,
+                                        int depth, const char **out_state) {
+    *out_state = "unknown";
+    /* Derivation graphs are acyclic in a well-formed store, but nothing stops
+       a writer from recording a cycle. Refusing to answer past a bound is
+       honest; recursing forever is not, and guessing "current" would establish
+       a claim from a failure to check (§13.2). */
+    if (depth > 16) return CHUTNI_OK;
+
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT a.status, COALESCE(a.source_content_hash,''), a.source_id"
+            " FROM artifacts a WHERE a.artifact_id=?1", -1, &q, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    sqlite3_bind_text(q, 1, artifact_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(q) != SQLITE_ROW) {
+        sqlite3_finalize(q);
+        return CHUTNI_ERR_NOTFOUND;
+    }
+    char status[32], artifact_hash[CHUTNI_HASH_STRLEN], source_id[CHUTNI_ID_STRLEN];
+    snprintf(status, sizeof status, "%s", (const char *)sqlite3_column_text(q, 0));
+    snprintf(artifact_hash, sizeof artifact_hash, "%s", (const char *)sqlite3_column_text(q, 1));
+    snprintf(source_id, sizeof source_id, "%s", (const char *)sqlite3_column_text(q, 2));
+    sqlite3_finalize(q);
+
+    if (strcmp(status, "active")) { *out_state = "stale"; return CHUTNI_OK; }
+    if (!artifact_hash[0]) return CHUTNI_OK;
+
+    char observed[CHUTNI_HASH_STRLEN];
+    const char *reason = "unknown";
+    if (!observe_source(s, source_id, observed, &reason)) {
+        *out_state = reason;
+        return CHUTNI_OK;
+    }
+    if (strcmp(observed, artifact_hash)) { *out_state = "stale"; return CHUTNI_OK; }
+
+    const char *input_state = "stale";
+    if (!derivation_inputs_current(s, artifact_id, depth, &input_state)) {
+        *out_state = input_state;
+        return CHUTNI_OK;
+    }
+    *out_state = "current";
+    return CHUTNI_OK;
+}
+
 chutni_status chutni_check_freshness(chutni_store *s, const char *id, const char **out_state) {
     if (!s || !id || !out_state) return CHUTNI_ERR_INVALID;
     *out_state = "unknown";
+
+    chutni_status st = artifact_freshness(s, id, 0, out_state);
+    if (st == CHUTNI_OK) return CHUTNI_OK;
+    if (st != CHUTNI_ERR_NOTFOUND) return st;
+
     sqlite3_stmt *q = NULL;
-
-    /* An artifact is current when the bytes it was derived from are still the
-       bytes on disk (§13.3).
-
-       Comparing the artifact's hash against the catalog's stored source hash is
-       not sufficient: both are catalog state, so if the file changed and
-       nothing has rescanned it yet, the two agree with each other and the
-       artifact reads as current while describing content that is gone. The
-       source's own bytes are the only authority, so this re-hashes the file. */
     if (sqlite3_prepare_v2(s->db,
-            "SELECT a.status, a.source_content_hash,"
-            "       json_extract(sc.locator_json,'$.display_path')"
-            " FROM artifacts a JOIN sources sc ON sc.source_id=a.source_id"
-            " WHERE a.artifact_id=?1", -1, &q, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(q, 1, id, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(q) == SQLITE_ROW) {
-            const char *status = (const char *)sqlite3_column_text(q, 0);
-            const unsigned char *ah = sqlite3_column_text(q, 1);
-            const unsigned char *ap = sqlite3_column_text(q, 2);
-            char artifact_hash[CHUTNI_HASH_STRLEN], source_path[PATH_MAX];
-            snprintf(artifact_hash, sizeof artifact_hash, "%s", ah ? (const char *)ah : "");
-            snprintf(source_path, sizeof source_path, "%s", ap ? (const char *)ap : "");
-            int demoted = status && strcmp(status, "active");
-            sqlite3_finalize(q);
-
-            if (demoted) { *out_state = "stale"; return CHUTNI_OK; }
-            if (!artifact_hash[0] || !source_path[0]) { *out_state = "unknown"; return CHUTNI_OK; }
-            if (access(source_path, R_OK) != 0) { *out_state = "missing"; return CHUTNI_OK; }
-            char actual[CHUTNI_HASH_STRLEN];
-            if (chutni_hash_file(source_path, actual) != CHUTNI_OK) {
-                *out_state = "unreadable";
-                return CHUTNI_OK;
-            }
-            *out_state = strcmp(actual, artifact_hash) ? "stale" : "current";
-            return CHUTNI_OK;
-        }
-        sqlite3_finalize(q);
-    }
-
-    if (sqlite3_prepare_v2(s->db,
-            "SELECT content_hash, json_extract(locator_json,'$.display_path'), state"
-            " FROM sources WHERE source_id=?1", -1, &q, NULL) != SQLITE_OK)
+            "SELECT COALESCE(content_hash,'') FROM sources WHERE source_id=?1",
+            -1, &q, NULL) != SQLITE_OK)
         return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
     sqlite3_bind_text(q, 1, id, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(q) != SQLITE_ROW) {
         sqlite3_finalize(q);
         return fail(s, CHUTNI_ERR_NOTFOUND, "no source or artifact with id %s", id);
     }
-    const unsigned char *stored = sqlite3_column_text(q, 0);
-    const unsigned char *path = sqlite3_column_text(q, 1);
-    char stored_copy[CHUTNI_HASH_STRLEN], path_copy[PATH_MAX];
-    snprintf(stored_copy, sizeof stored_copy, "%s", stored ? (const char *)stored : "");
-    snprintf(path_copy, sizeof path_copy, "%s", path ? (const char *)path : "");
+    char stored[CHUTNI_HASH_STRLEN];
+    snprintf(stored, sizeof stored, "%s", (const char *)sqlite3_column_text(q, 0));
     sqlite3_finalize(q);
 
-    if (!path_copy[0]) return CHUTNI_OK;
-    if (access(path_copy, R_OK) != 0) { *out_state = "missing"; return CHUTNI_OK; }
-    if (!stored_copy[0]) return CHUTNI_OK;
-    char actual[CHUTNI_HASH_STRLEN];
-    if (chutni_hash_file(path_copy, actual) != CHUTNI_OK) { *out_state = "unreadable"; return CHUTNI_OK; }
-    *out_state = strcmp(actual, stored_copy) ? "stale" : "current";
+    char observed[CHUTNI_HASH_STRLEN];
+    const char *reason = "unknown";
+    if (!observe_source(s, id, observed, &reason)) { *out_state = reason; return CHUTNI_OK; }
+    if (!stored[0]) return CHUTNI_OK;
+    *out_state = strcmp(observed, stored) ? "stale" : "current";
     return CHUTNI_OK;
 }
 
@@ -1608,49 +2210,41 @@ chutni_status chutni_source_refresh(chutni_store *s, const char *source_id,
 
     sqlite3_stmt *q = NULL;
     if (sqlite3_prepare_v2(s->db,
-            "SELECT COALESCE(content_hash,''), json_extract(locator_json,'$.display_path')"
-            " FROM sources WHERE source_id=?1", -1, &q, NULL) != SQLITE_OK)
+            "SELECT COALESCE(content_hash,'') FROM sources WHERE source_id=?1",
+            -1, &q, NULL) != SQLITE_OK)
         return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
     sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(q) != SQLITE_ROW) {
         sqlite3_finalize(q);
         return fail(s, CHUTNI_ERR_NOTFOUND, "no source with id %s", source_id);
     }
-    char stored[CHUTNI_HASH_STRLEN], path[PATH_MAX];
+    char stored[CHUTNI_HASH_STRLEN];
     snprintf(stored, sizeof stored, "%s", (const char *)sqlite3_column_text(q, 0));
-    const unsigned char *p = sqlite3_column_text(q, 1);
-    snprintf(path, sizeof path, "%s", p ? (const char *)p : "");
     sqlite3_finalize(q);
 
     char now[32];
     iso_now(now);
 
-    if (!path[0] || access(path, R_OK) != 0) {
-        chutni_source_set_state(s, source_id, CHUTNI_SOURCE_MISSING);
-        *out_state = "missing";
-        return CHUTNI_OK;
-    }
+    /* A file's bytes or a directory's listing, re-read from disk either way. */
     char actual[CHUTNI_HASH_STRLEN];
-    if (chutni_hash_file(path, actual) != CHUTNI_OK) {
-        chutni_source_set_state(s, source_id, CHUTNI_SOURCE_UNREADABLE);
-        *out_state = "unreadable";
-        return CHUTNI_OK;
-    }
-    if (stored[0] && !strcmp(stored, actual)) {
-        if (sqlite3_prepare_v2(s->db,
-                "UPDATE sources SET last_scanned_at=?2, state='present' WHERE source_id=?1",
-                -1, &q, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(q, 2, now, -1, SQLITE_TRANSIENT);
-            sqlite3_step(q);
-            sqlite3_finalize(q);
+    const char *reason = "unknown";
+    if (!observe_source(s, source_id, actual, &reason)) {
+        if (!strcmp(reason, "missing"))
+            chutni_source_set_state(s, source_id, CHUTNI_SOURCE_MISSING);
+        else if (!strcmp(reason, "unreadable"))
+            chutni_source_set_state(s, source_id, CHUTNI_SOURCE_UNREADABLE);
+        *out_state = reason;
+        /* An opaque directory has nothing to compare, and its artifacts still
+           need their derivation inputs checked. */
+        if (!strcmp(reason, "current")) {
+            if (!sql_exec(s, "BEGIN IMMEDIATE")) return CHUTNI_ERR_DB;
+            cascade_stale_dependents(s, now);
+            if (!sql_exec(s, "COMMIT")) return CHUTNI_ERR_DB;
         }
-        *out_state = "current";
         return CHUTNI_OK;
     }
 
-    /* The bytes moved on. Record the new hash and demote every artifact that
-       described the old ones. */
+    int drifted = !(stored[0] && !strcmp(stored, actual));
     if (!sql_exec(s, "BEGIN IMMEDIATE")) return CHUTNI_ERR_DB;
     if (sqlite3_prepare_v2(s->db,
             "UPDATE sources SET content_hash=?2, last_scanned_at=?3, state='present'"
@@ -1661,28 +2255,14 @@ chutni_status chutni_source_refresh(chutni_store *s, const char *source_id,
         sqlite3_step(q);
         sqlite3_finalize(q);
     }
-    if (sqlite3_prepare_v2(s->db,
-            "UPDATE artifacts SET status='stale', updated_at=?3 WHERE source_id=?1"
-            " AND status='active' AND source_content_hash IS NOT NULL"
-            " AND source_content_hash<>?2", -1, &q, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(q, 2, actual, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(q, 3, now, -1, SQLITE_TRANSIENT);
-        sqlite3_step(q);
-        sqlite3_finalize(q);
-    }
-    /* Keep the lexical index in step: it indexes active artifacts only. */
-    if (s->have_index &&
-        sqlite3_prepare_v2(s->db,
-            "DELETE FROM idx.artifacts_fts WHERE artifact_id IN"
-            " (SELECT artifact_id FROM artifacts WHERE source_id=?1 AND status<>'active')",
-            -1, &q, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
-        sqlite3_step(q);
-        sqlite3_finalize(q);
-    }
+    /* The observation moved on. Demote every artifact that described the old
+       one, then everything derived from those (§13.3). The cascade runs even
+       when this source held still, because a source it depends on may not
+       have. */
+    if (drifted) stale_artifacts_not_matching(s, source_id, actual, now);
+    cascade_stale_dependents(s, now);
     if (!sql_exec(s, "COMMIT")) return CHUTNI_ERR_DB;
-    *out_state = "stale";
+    *out_state = drifted ? "stale" : "current";
     return CHUTNI_OK;
 }
 
@@ -1770,6 +2350,55 @@ static void fts_insert(chutni_store *s, const char *artifact_id, const char *sou
     sqlite3_finalize(q);
 }
 
+/* §15.5–§15.7. The three hierarchical kinds mean specific things about what was
+ * looked at, so the store enforces that they are attached to something that
+ * could have been looked at, and that a definition says how far it looked.
+ *
+ * The coverage requirement is the whole reason these kinds are worth adding. A
+ * definition written from four filenames and a definition written from the
+ * entire subtree are otherwise the same record, and a second application
+ * reading the store has no way to tell which one it is trusting. */
+static chutni_status validate_hierarchical_artifact(chutni_store *s,
+                                                    const chutni_artifact *a,
+                                                    int is_directory,
+                                                    const char *source_hash,
+                                                    const char *observation) {
+    int listing  = !strcmp(a->artifact_kind, CHUTNI_KIND_DIRECTORY_LISTING);
+    int manifest = !strcmp(a->artifact_kind, CHUTNI_KIND_COVERAGE_MANIFEST);
+    int definition = !strcmp(a->artifact_kind, CHUTNI_KIND_SOURCE_DEFINITION);
+
+    if ((listing || manifest) && !is_directory)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "%s belongs to a directory source (§15.5, §15.7)",
+                    a->artifact_kind);
+
+    /* An unopened directory has no observation to bind a claim to. A producer
+       that wants to describe one observes it first — one directory, no
+       recursion — rather than describing the inside of a box it never opened. */
+    if (is_directory && a->source_content_hash && !source_hash[0])
+        return fail(s, CHUTNI_ERR_DENIED,
+                    "directory source is %s; observe it before recording derived artifacts (§12.5)",
+                    observation && *observation ? observation : "not enumerated");
+
+    if (!definition || !is_directory) return CHUTNI_OK;
+
+    if (!a->metadata_json)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "a directory source_definition must record its local coverage (§15.6)");
+    cj *meta = cj_parse(a->metadata_json, NULL);
+    cj *coverage = cj_get(meta, "coverage");
+    const char *stop = coverage ? cj_get_str(coverage, "stop_reason") : NULL;
+    cj *complete = coverage ? cj_get(coverage, "complete_for_policy") : NULL;
+    int ok = coverage && coverage->type == CJ_OBJ && stop && *stop &&
+             complete && complete->type == CJ_BOOL;
+    cj_free(meta);
+    if (!ok)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "a directory source_definition needs coverage.stop_reason and "
+                    "coverage.complete_for_policy (§15.6)");
+    return CHUTNI_OK;
+}
+
 static chutni_status validate_artifact(chutni_store *s,
                                        const chutni_artifact *a) {
     if (!a->source_id || !a->artifact_kind || !a->artifact_origin)
@@ -1825,13 +2454,17 @@ static chutni_status validate_artifact(chutni_store *s,
     sqlite3_stmt *query = NULL;
     if (sqlite3_prepare_v2(
             s->db,
-            "SELECT state, content_hash FROM sources WHERE source_id=?1",
+            "SELECT state, content_hash, COALESCE(source_kind,'file'),"
+            " COALESCE(json_extract(metadata_json,'$.observation'),'')"
+            " FROM sources WHERE source_id=?1",
             -1, &query, NULL) != SQLITE_OK)
         return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
     sqlite3_bind_text(query, 1, a->source_id, -1, SQLITE_TRANSIENT);
     int row = sqlite3_step(query);
     char source_state[32] = "";
     char source_hash[CHUTNI_HASH_STRLEN] = "";
+    char source_kind[32] = "";
+    char observation[32] = "";
     if (row == SQLITE_ROW) {
         const unsigned char *state = sqlite3_column_text(query, 0);
         const unsigned char *hash = sqlite3_column_text(query, 1);
@@ -1839,11 +2472,21 @@ static chutni_status validate_artifact(chutni_store *s,
                             (const char *)state);
         if (hash) snprintf(source_hash, sizeof source_hash, "%s",
                            (const char *)hash);
+        snprintf(source_kind, sizeof source_kind, "%s",
+                 (const char *)sqlite3_column_text(query, 2));
+        snprintf(observation, sizeof observation, "%s",
+                 (const char *)sqlite3_column_text(query, 3));
     }
     sqlite3_finalize(query);
     if (row != SQLITE_ROW)
         return fail(s, CHUTNI_ERR_NOTFOUND,
                     "artifact source_id is not in this store");
+
+    int is_directory = !strcmp(source_kind, "directory");
+    chutni_status hierarchy = validate_hierarchical_artifact(s, a, is_directory,
+                                                             source_hash, observation);
+    if (hierarchy != CHUTNI_OK) return hierarchy;
+
     if (a->source_content_hash &&
         (!source_hash[0] || strcmp(a->source_content_hash, source_hash)))
         return fail(s, CHUTNI_ERR_DENIED,
@@ -2036,6 +2679,305 @@ chutni_status chutni_artifacts_put(
     sql_exec(s, "ROLLBACK");
     return fail(s, status, "%s",
                 detail[0] ? detail : chutni_strerror(status));
+}
+
+/* ------------------------------------------------------------- relationships */
+
+static int id_exists(chutni_store *s, const char *id) {
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT 1 FROM sources WHERE source_id=?1"
+            " UNION ALL SELECT 1 FROM artifacts WHERE artifact_id=?1",
+            -1, &q, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(q, 1, id, -1, SQLITE_TRANSIENT);
+    int found = sqlite3_step(q) == SQLITE_ROW;
+    sqlite3_finalize(q);
+    return found;
+}
+
+chutni_status chutni_relation_put(chutni_store *s, const char *from_id,
+                                  const char *predicate, const char *to_id,
+                                  const char *derivation_id,
+                                  const char *metadata_json,
+                                  char relation_id[CHUTNI_ID_STRLEN]) {
+    if (!s || !from_id || !predicate || !*predicate || !to_id || !relation_id)
+        return CHUTNI_ERR_INVALID;
+    if (s->read_only) return fail(s, CHUTNI_ERR_READONLY, "store is read-only");
+    /* §18 requires a model-created relation to carry a derivation ID, and
+       nothing downstream can tell which relations came from a model. Requiring
+       one from everybody is the only version of that rule a store can actually
+       enforce, and a relation is a claim like any other. */
+    if (!derivation_id)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "a relation requires processing provenance (§18)");
+    if (metadata_json && !json_text_has_type(metadata_json, CJ_OBJ))
+        return fail(s, CHUTNI_ERR_INVALID, "relation metadata_json must be a JSON object");
+    if (!id_exists(s, from_id))
+        return fail(s, CHUTNI_ERR_NOTFOUND, "relation from_id is not in this store");
+    if (!id_exists(s, to_id))
+        return fail(s, CHUTNI_ERR_NOTFOUND, "relation to_id is not in this store");
+
+    /* Re-asserting a relation is not a new fact about the world. Repeating a
+       scan would otherwise multiply every `contains` edge by the scan count. */
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT relation_id FROM relations"
+            " WHERE from_id=?1 AND predicate=?2 AND to_id=?3 AND derivation_id IS ?4",
+            -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, from_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 2, predicate, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 3, to_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 4, derivation_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            snprintf(relation_id, CHUTNI_ID_STRLEN, "%s",
+                     (const char *)sqlite3_column_text(q, 0));
+            sqlite3_finalize(q);
+            return CHUTNI_OK;
+        }
+        sqlite3_finalize(q);
+    }
+
+    if (!uuid7(relation_id)) return fail(s, CHUTNI_ERR_IO, "no entropy");
+    char now[32];
+    iso_now(now);
+    if (sqlite3_prepare_v2(s->db,
+            "INSERT INTO relations(relation_id,from_id,predicate,to_id,derivation_id,"
+            "created_at,metadata_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            -1, &q, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    sqlite3_bind_text(q, 1, relation_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 2, from_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 3, predicate, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 4, to_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 5, derivation_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(q, 6, now, -1, SQLITE_TRANSIENT);
+    bind_text_or_null(q, 7, metadata_json);
+    int rc = sqlite3_step(q);
+    sqlite3_finalize(q);
+    if (rc != SQLITE_DONE) return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    return CHUTNI_OK;
+}
+
+chutni_status chutni_relations_list(chutni_store *s, const char *from_id,
+                                    const char *predicate,
+                                    chutni_relation_info **out, size_t *count) {
+    if (!s || !out || !count) return CHUTNI_ERR_INVALID;
+    *out = NULL;
+    *count = 0;
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT relation_id, from_id, predicate, to_id, derivation_id,"
+            " created_at, metadata_json FROM relations"
+            " WHERE (?1 IS NULL OR from_id=?1) AND (?2 IS NULL OR predicate=?2)"
+            " ORDER BY created_at, relation_id", -1, &q, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    bind_text_or_null(q, 1, from_id);
+    bind_text_or_null(q, 2, predicate);
+    chutni_relation_info *vec = NULL;
+    size_t n = 0, cap = 0;
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        if (n == cap) {
+            size_t c = cap ? cap * 2 : 16;
+            chutni_relation_info *t = realloc(vec, c * sizeof *t);
+            if (!t) break;
+            vec = t;
+            cap = c;
+        }
+        vec[n].relation_id   = dup_col(q, 0);
+        vec[n].from_id       = dup_col(q, 1);
+        vec[n].predicate     = dup_col(q, 2);
+        vec[n].to_id         = dup_col(q, 3);
+        vec[n].derivation_id = dup_col(q, 4);
+        vec[n].created_at    = dup_col(q, 5);
+        vec[n].metadata_json = dup_col(q, 6);
+        n++;
+    }
+    sqlite3_finalize(q);
+    *out = vec;
+    *count = n;
+    return CHUTNI_OK;
+}
+
+void chutni_relation_info_free(chutni_relation_info *relations, size_t count) {
+    if (!relations) return;
+    for (size_t i = 0; i < count; i++) {
+        free(relations[i].relation_id);
+        free(relations[i].from_id);
+        free(relations[i].predicate);
+        free(relations[i].to_id);
+        free(relations[i].derivation_id);
+        free(relations[i].created_at);
+        free(relations[i].metadata_json);
+    }
+    free(relations);
+}
+
+/* ----------------------------------------------------------------- coverage */
+
+/* An artifact's payload as text, whether it was stored inline or as an object. */
+static char *artifact_payload_text(chutni_store *s, const char *artifact_id) {
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT inline_text, object_hash FROM artifacts WHERE artifact_id=?1",
+            -1, &q, NULL) != SQLITE_OK) return NULL;
+    sqlite3_bind_text(q, 1, artifact_id, -1, SQLITE_TRANSIENT);
+    char *text = NULL, hash[CHUTNI_HASH_STRLEN] = "";
+    if (sqlite3_step(q) == SQLITE_ROW) {
+        const unsigned char *inline_text = sqlite3_column_text(q, 0);
+        const unsigned char *object_hash = sqlite3_column_text(q, 1);
+        if (inline_text) text = strdup((const char *)inline_text);
+        else if (object_hash) snprintf(hash, sizeof hash, "%s", (const char *)object_hash);
+    }
+    sqlite3_finalize(q);
+    if (text || !hash[0]) return text;
+
+    void *data = NULL;
+    size_t len = 0;
+    if (chutni_object_get(s, hash, &data, &len) != CHUTNI_OK) return NULL;
+    char *copy = malloc(len + 1);
+    if (copy) { memcpy(copy, data, len); copy[len] = 0; }
+    free(data);
+    return copy;
+}
+
+/* The directory source at the top of a region: the one a coverage manifest is
+   attached to. Walks parents rather than trusting root_id alone, because a
+   source may predate hierarchical scanning and have no parent recorded. */
+static int region_root_source(chutni_store *s, const char *source_id,
+                              char out[CHUTNI_ID_STRLEN]) {
+    char current[CHUTNI_ID_STRLEN];
+    snprintf(current, sizeof current, "%s", source_id);
+    for (int hop = 0; hop < 256; hop++) {
+        sqlite3_stmt *q = NULL;
+        if (sqlite3_prepare_v2(s->db,
+                "SELECT COALESCE(parent_source_id,'') FROM sources WHERE source_id=?1",
+                -1, &q, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_text(q, 1, current, -1, SQLITE_TRANSIENT);
+        int found = sqlite3_step(q) == SQLITE_ROW;
+        char parent[CHUTNI_ID_STRLEN] = "";
+        if (found) snprintf(parent, sizeof parent, "%s",
+                            (const char *)sqlite3_column_text(q, 0));
+        sqlite3_finalize(q);
+        if (!found) return 0;
+        if (!parent[0]) {
+            snprintf(out, CHUTNI_ID_STRLEN, "%s", current);
+            return 1;
+        }
+        snprintf(current, sizeof current, "%s", parent);
+    }
+    return 0;
+}
+
+/* The current coverage manifest for a region, or "" when there is none. */
+static void current_coverage_manifest(chutni_store *s, const char *root_source_id,
+                                      char out[CHUTNI_ID_STRLEN]) {
+    out[0] = 0;
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT artifact_id FROM artifacts WHERE source_id=?1"
+            " AND artifact_kind='" CHUTNI_KIND_COVERAGE_MANIFEST "' AND status='active'"
+            " ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+            -1, &q, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(q, 1, root_source_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(q) == SQLITE_ROW)
+        snprintf(out, CHUTNI_ID_STRLEN, "%s", (const char *)sqlite3_column_text(q, 0));
+    sqlite3_finalize(q);
+}
+
+chutni_status chutni_get_coverage(chutni_store *s, const char *id, char **json) {
+    if (!s || !id || !json) return CHUTNI_ERR_INVALID;
+    *json = NULL;
+
+    /* A root id and a source id are both reasonable things for a caller to
+       have; resolve either to the directory source the manifest hangs off. */
+    char source_id[CHUTNI_ID_STRLEN] = "";
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT source_id FROM sources WHERE root_id=?1 AND parent_source_id IS NULL"
+            " AND source_kind='directory' ORDER BY first_seen_at LIMIT 1",
+            -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(q) == SQLITE_ROW)
+            snprintf(source_id, sizeof source_id, "%s",
+                     (const char *)sqlite3_column_text(q, 0));
+        sqlite3_finalize(q);
+    }
+    if (!source_id[0]) snprintf(source_id, sizeof source_id, "%s", id);
+
+    char kind[32] = "", observation[32] = "", state[32] = "";
+    int depth = -1, found = 0;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT COALESCE(source_kind,'file'),"
+            " COALESCE(json_extract(metadata_json,'$.observation'),''),"
+            " COALESCE(json_extract(metadata_json,'$.depth'),-1), state"
+            " FROM sources WHERE source_id=?1", -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            found = 1;
+            snprintf(kind, sizeof kind, "%s", (const char *)sqlite3_column_text(q, 0));
+            snprintf(observation, sizeof observation, "%s",
+                     (const char *)sqlite3_column_text(q, 1));
+            depth = sqlite3_column_int(q, 2);
+            snprintf(state, sizeof state, "%s", (const char *)sqlite3_column_text(q, 3));
+        }
+        sqlite3_finalize(q);
+    }
+    if (!found) return fail(s, CHUTNI_ERR_NOTFOUND, "no root or source with id %s", id);
+
+    char region[CHUTNI_ID_STRLEN] = "", manifest_id[CHUTNI_ID_STRLEN] = "";
+    if (region_root_source(s, source_id, region))
+        current_coverage_manifest(s, region, manifest_id);
+
+    cj *root = cj_obj();
+    cj_set(root, "source_id", cj_str(source_id));
+    cj_set(root, "source_kind", cj_str(kind));
+    cj_set(root, "state", cj_str(state));
+    if (observation[0]) cj_set(root, "observation", cj_str(observation));
+    cj_set(root, "depth", depth < 0 ? cj_null() : cj_num((double)depth));
+    cj_set(root, "root_source_id", region[0] ? cj_str(region) : cj_null());
+    cj_set(root, "coverage_manifest_id", manifest_id[0] ? cj_str(manifest_id) : cj_null());
+
+    if (manifest_id[0]) {
+        char *payload = artifact_payload_text(s, manifest_id);
+        cj *parsed = payload ? cj_parse(payload, NULL) : NULL;
+        free(payload);
+        cj_set(root, "coverage_manifest", parsed ? parsed : cj_null());
+    } else {
+        /* An explicit null, not an omitted key. Silence here would read as
+           "nothing was covered"; it means nobody recorded coverage, which a
+           consumer must handle differently (§35.1). */
+        cj_set(root, "coverage_manifest", cj_null());
+    }
+
+    /* A directory's own definition carries a local coverage block the
+       region-wide manifest does not: how far that one definition looked. */
+    cj *local = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT artifact_id, metadata_json FROM artifacts WHERE source_id=?1"
+            " AND artifact_kind='" CHUTNI_KIND_SOURCE_DEFINITION "' AND status='active'"
+            " ORDER BY created_at DESC LIMIT 1", -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            const unsigned char *aid = sqlite3_column_text(q, 0);
+            const unsigned char *meta = sqlite3_column_text(q, 1);
+            local = cj_obj();
+            cj_set(local, "artifact_id", cj_str(aid ? (const char *)aid : ""));
+            cj *parsed = meta ? cj_parse((const char *)meta, NULL) : NULL;
+            cj *coverage = cj_get(parsed, "coverage");
+            /* Re-serialize rather than hand out a subtree the parse tree owns. */
+            char *text = coverage ? cj_dump(coverage, -1) : NULL;
+            cj_free(parsed);
+            cj *copy = text ? cj_parse(text, NULL) : NULL;
+            free(text);
+            cj_set(local, "coverage", copy ? copy : cj_null());
+        }
+        sqlite3_finalize(q);
+    }
+    cj_set(root, "definition", local ? local : cj_null());
+
+    *json = cj_dump(root, 2);
+    cj_free(root);
+    return *json ? CHUTNI_OK : CHUTNI_ERR_NOMEM;
 }
 
 /* ----------------------------------------------------------- representations */
@@ -2515,6 +3457,40 @@ static void search_result_clear(chutni_search_result *r) {
     free(r->selector_json);
     free(r->freshness);
     free(r->score_type);
+    free(r->source_kind);
+    free(r->parent_source_id);
+    free(r->coverage_manifest_id);
+}
+
+/* §19.3. A path and a snippet cannot tell a consumer whether the region the
+   hit came from was exhaustively indexed or read one level deep, and a
+   consumer that cannot tell will assume the former. Every result carries the
+   coverage manifest governing its region so the question has an answer.
+
+   One walk up the parent chain per result: result sets are small and bounded
+   by `limit`, and caching a hierarchy that a concurrent writer may be changing
+   is exactly the kind of trusted cached state this format exists to avoid. */
+static void fill_hierarchy_fields(chutni_store *s, chutni_search_result *r) {
+    r->depth = -1;
+    if (!r->source_id || !*r->source_id) return;
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT COALESCE(source_kind,'file'), parent_source_id,"
+            " COALESCE(json_extract(metadata_json,'$.depth'),-1)"
+            " FROM sources WHERE source_id=?1", -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, r->source_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            r->source_kind      = dup_col(q, 0);
+            r->parent_source_id = dup_col(q, 1);
+            r->depth            = sqlite3_column_int(q, 2);
+        }
+        sqlite3_finalize(q);
+    }
+    char region[CHUTNI_ID_STRLEN] = "", manifest[CHUTNI_ID_STRLEN] = "";
+    if (region_root_source(s, r->source_id, region)) {
+        current_coverage_manifest(s, region, manifest);
+        if (manifest[0]) r->coverage_manifest_id = strdup(manifest);
+    }
 }
 
 chutni_status chutni_search_semantic(chutni_store *s,
@@ -2639,6 +3615,7 @@ chutni_status chutni_search_semantic(chutni_store *s,
             r->display_path,
             sqlite3_column_int64(q, 17),
             sqlite3_column_int64(q, 18)));
+        fill_hierarchy_fields(s, r);
         n++;
     }
     sqlite3_finalize(q);
@@ -2733,6 +3710,7 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
             r->display_path,
             sqlite3_column_int64(q, 12),
             sqlite3_column_int64(q, 13)));
+        fill_hierarchy_fields(s, r);
         n++;
     }
     sqlite3_finalize(q);
