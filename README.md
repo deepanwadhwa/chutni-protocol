@@ -136,6 +136,24 @@ index is worse than no index.
 
 ## Use from an application
 
+### Python
+
+After `make`, a stdlib-only binding is available from `python/` (or install it
+with `pip install -e python/`). Point `CHUTNI_LIBRARY` at the shared library
+when it is not installed under `/usr/local/lib`:
+
+```python
+from chutni import Store
+with Store.create("~/Memory.chutni", label="My files") as s:
+    s.add_root("~/Documents", max_depth=1, memory_goal="define")
+    s.scan()
+    for hit in s.search("condensation force", limit=5):
+        print(hit["display_path"], hit["freshness"], hit["snippet"])
+```
+
+Results remain plain dictionaries, including coverage and freshness fields.
+Stores are synchronous and must not be shared between threads without a lock.
+
 Applications do not need to reimplement the catalog or teach the language model
 SQL. They can bundle and launch the same `chutni-mcp` executable:
 

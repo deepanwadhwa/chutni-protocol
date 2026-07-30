@@ -40,13 +40,25 @@ SQL_OBJ  := $(BUILD)/third_party/sqlite/sqlite3.o
 LIBCHUTNI := $(BUILD)/libchutni.a
 CLI       := $(BUILD)/chutni
 MCP       := $(BUILD)/chutni-mcp
+UNAME_S   := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+SHLIB     := $(BUILD)/libchutni.dylib
+SHLIBFLAG := -dynamiclib
+else
+SHLIB     := $(BUILD)/libchutni.so
+SHLIBFLAG := -shared
+endif
 
-.PHONY: all clean test install conformance sanitize
-all: $(CLI) $(MCP)
+.PHONY: all clean test install conformance sanitize python-test
+all: $(CLI) $(MCP) $(SHLIB)
 
 $(LIBCHUTNI): $(LIB_OBJ) $(B3_OBJ) $(SQL_OBJ)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
+
+$(SHLIB): $(LIB_SRC) $(B3_SRC) third_party/sqlite/sqlite3.c VERSION
+	$(CC) -std=c99 $(OPT) $(VERDEF) -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite -fPIC $(SHLIBFLAG) $(B3FLAGS) $(SQLFLAGS) -o $@ \
+	    $(LIB_SRC) $(B3_SRC) third_party/sqlite/sqlite3.c -lpthread
 
 $(CLI): $(BUILD)/src/cli.o $(LIBCHUTNI)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) -lpthread
@@ -101,6 +113,10 @@ test: $(CLI) $(MCP) $(BUILD)/blake3_vectors $(BUILD)/conformance $(BUILD)/call_s
 	@sh tests/conformance/run.sh $(CLI)
 	@echo
 	@CHUTNI_MCP=$(MCP) python3 tests/test_mcp.py
+	@$(MAKE) python-test
+
+python-test: $(SHLIB)
+	@CHUTNI_LIBRARY=$(abspath $(SHLIB)) PYTHONPATH=$(abspath python) python3 -m unittest discover -s python/tests -v
 
 conformance: test
 
