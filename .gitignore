@@ -11,3 +11,7 @@ build/
 .DS_Store
 *.swp
 compile_commands.json
+
+# Python test byproducts.
+__pycache__/
+*.pyc
