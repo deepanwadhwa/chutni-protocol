@@ -36,7 +36,7 @@ and move to the next unblocked ticket.
 | ID | Status | Branch / commit |
 |---|---|---|
 | T01 | done | JSON call surface, [evidence](../evidence/2026-07-30-json-call-surface/report.md) |
-| T02 | not started | — |
+| T02 | done | python/chutni/, `make python-test` |
 | T03 | not started | — |
 | T04 | not started | — |
 | T05 | not started | — |

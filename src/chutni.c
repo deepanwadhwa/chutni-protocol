@@ -4043,6 +4043,38 @@ static chutni_status jcall_op_store_info(chutni_store *s, const cj *args, cj **o
     return CHUTNI_OK;
 }
 
+static chutni_status jcall_op_add_root(chutni_store *s, const cj *args, cj **out) {
+    const char *path = jarg_str(args, "path");
+    if (!path || !*path) return fail(s, CHUTNI_ERR_INVALID, "path is required");
+    chutni_root_policy policy;
+    chutni_root_policy_defaults(&policy);
+    cj *p = cj_get(args, "policy");
+    if (p && p->type != CJ_OBJ)
+        return fail(s, CHUTNI_ERR_INVALID, "policy must be a JSON object");
+    if (p) {
+        policy.recursive = jarg_bool(p, "recursive", policy.recursive);
+        policy.follow_symlinks = jarg_bool(p, "follow_symlinks", policy.follow_symlinks);
+        policy.include_hidden = jarg_bool(p, "include_hidden", policy.include_hidden);
+        policy.retain_deleted_artifacts =
+            jarg_bool(p, "retain_deleted_artifacts", policy.retain_deleted_artifacts);
+        cj *n = cj_get(p, "max_file_size_bytes");
+        if (n && n->type == CJ_NUM && n->num > 0) policy.max_file_size_bytes = (uint64_t)n->num;
+        n = cj_get(p, "max_depth");
+        if (n && n->type == CJ_NUM && n->num >= 0) policy.max_depth = (int)n->num;
+        policy.memory_goal = jarg_str(p, "memory_goal");
+        policy.definition_mode = jarg_str(p, "definition_mode");
+    }
+    char root_id[CHUTNI_ID_STRLEN];
+    chutni_status status = chutni_root_add(s, path, jarg_str(args, "label"),
+                                           &policy, root_id);
+    if (status != CHUTNI_OK) return status;
+    cj *result = cj_obj();
+    cj_set(result, "root_id", cj_str(root_id));
+    cj_set(result, "path", cj_str(path));
+    *out = result;
+    return CHUTNI_OK;
+}
+
 static chutni_status jcall_op_scan(chutni_store *s, const cj *args, cj **out) {
     chutni_scan_options options;
     memset(&options, 0, sizeof options);
@@ -4949,6 +4981,8 @@ chutni_status chutni_call(chutni_store *s, const char *operation,
                      "operation \"%s\" requires an open store", operation);
     } else if (!strcmp(operation, "store_info")) {
         status = jcall_op_store_info(s, args, &out);
+    } else if (!strcmp(operation, "add_root")) {
+        status = jcall_op_add_root(s, args, &out);
     } else if (!strcmp(operation, "scan")) {
         status = jcall_op_scan(s, args, &out);
     } else if (!strcmp(operation, "children")) {
