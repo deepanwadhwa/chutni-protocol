@@ -287,8 +287,9 @@ Not blocking, but they will need answers before v0.3.
   allowed and a second process receives `CHUTNI_ERR_BUSY`. Distributed merge
   or synchronized multi-writer conflict resolution remains a v0.2 question,
   not a local-store requirement.
-- **`skills/` needs a real test.** The instructions have never been run through
-  an actual agent against a real store. Until they have, they are a hypothesis.
+- ~~**`skills/` needs a real test.**~~ **Answered 2026-07-30.** Codex followed
+  the skill against a bounded store with current, unverified, opaque, and
+  prompt-injection fixtures; see [T05 evidence](evidence/2026-07-30-codex-agent-integration/report.md).
 - **Directory freshness costs an enumeration.** `chutni verify` now re-reads
   every directory's entries as well as re-hashing every file. That is cheap
   relative to the hashing, but on a store with many directories and few files

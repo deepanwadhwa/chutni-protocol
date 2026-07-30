@@ -6,7 +6,7 @@ across agent runtimes rather than tied to one vendor's format.
 
 | Directory | For | Install |
 |---|---|---|
-| [chutni-memory/](chutni-memory/) | Claude Code, Claude Agent SDK, and any runtime that reads `SKILL.md` frontmatter | copy into `~/.claude/skills/` or a project's `.claude/skills/` |
+| [chutni-memory/](chutni-memory/) | Codex, Claude Code, Claude Agent SDK, and any runtime that reads `SKILL.md` frontmatter | copy into the runtime's project instructions or skill directory |
 
 ## Using these with other applications
 
