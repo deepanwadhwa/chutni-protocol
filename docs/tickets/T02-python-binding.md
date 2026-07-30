@@ -1,7 +1,7 @@
 # T02 — Python binding (stdlib-only ctypes)
 
 **Priority:** P0 · **Size:** M · **Depends on:** T01 · **Spec:** §34, TASKS A4
-**Status:** proposed 2026-07-30
+**Status:** in progress 2026-07-30 — `ticket/T02-python-binding`
 
 ## Why
 
