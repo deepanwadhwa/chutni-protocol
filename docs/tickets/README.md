@@ -39,7 +39,7 @@ and move to the next unblocked ticket.
 | T02 | done | python/chutni/, `make python-test` |
 | T03 | not started | — |
 | T04 | not started | — |
-| T05 | not started | — |
+| T05 | in progress | ticket/T05-codex-agent-integration |
 | T06 | done | docs/IMPLEMENTERS.md, evidence/2026-07-30-implementers-quickstart/ |
 | T07 | not started | — |
 | T08 | not started | — |
