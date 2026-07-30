@@ -146,12 +146,14 @@ def main():
             "chutni_discover",
             "chutni_capabilities",
             "chutni_store_info",
+            "chutni_list_sources",
             "chutni_scan",
             "chutni_search",
             "chutni_children",
             "chutni_observe_directory",
             "chutni_coverage",
             "chutni_source_context",
+            "chutni_put_derived_artifact",
             "chutni_put_artifacts",
             "chutni_put_model_artifact",
         }
@@ -254,6 +256,41 @@ def main():
         assert info["counts"]["sources_directories"] == 1
         assert info["counts"]["sources_opaque_directories"] == 0
         assert info["counts"]["artifacts_active"] == 4
+        assert info["counts"]["content_artifacts"] == 1
+        assert info["counts"]["metadata_artifacts"] == 1
+        assert info["counts"]["content_readable_sources"] == 1
+        assert info["counts"]["metadata_only_sources"] == 0
+
+        listed_sources, failed = session.tool(
+            "chutni_list_sources",
+            {
+                "store_path": str(store),
+                "source_path": str(source.resolve()),
+                "limit": 1,
+                "offset": 0,
+            },
+        )
+        assert not failed, listed_sources
+        assert listed_sources["count"] == 1
+        assert listed_sources["returned"] == 1
+        assert listed_sources["truncated"] is False
+        assert [item["display_path"] for item in listed_sources["sources"]] == [
+            str(note.resolve())
+        ]
+        assert all(
+            item["media_type"] and item["state"] == "present"
+            for item in listed_sources["sources"]
+        )
+
+        refused_sources, failed = session.tool(
+            "chutni_list_sources",
+            {
+                "store_path": str(store),
+                "source_path": str(root),
+            },
+        )
+        assert failed
+        assert refused_sources["error"] == "root_not_authorized"
 
         discovered, failed = session.tool("chutni_discover", {})
         assert not failed
@@ -288,12 +325,48 @@ def main():
         )
         assert not failed and current["count"] == 1
 
+        unicode_query, failed = session.tool(
+            "chutni_search",
+            {"store_path": str(store), "query": "Poličar 2019"},
+        )
+        assert not failed
+        assert unicode_query["query"] == "Poličar 2019"
+
         current_context, failed = session.tool(
             "chutni_source_context",
             {"store_path": str(store), "source_path": str(note)},
         )
         assert not failed, current_context
         current_hash = current_context["source"]["content_hash"]
+
+        derived_request = {
+            "store_path": str(store),
+            "source_path": str(note),
+            "text": "A deterministic reader found chromatophores.",
+            "artifact_kind": "page_text",
+            "producer_kind": "parser",
+            "producer_name": "Compatibility reader",
+            "producer_version": "reader-v1",
+            "runtime": "test-runtime",
+            "app_name": "test-host",
+            "app_version": "1.0",
+            "operation": "extract_page",
+            "recipe_hash": "reader-v1",
+            "parameters": {"page": 1},
+            "selector": {"type": "pages", "start": 1, "end": 1},
+            "confirmed": True,
+        }
+        derived, failed = session.tool(
+            "chutni_put_derived_artifact", derived_request
+        )
+        assert not failed, derived
+        assert derived["artifact_id"]
+        derived_again, failed = session.tool(
+            "chutni_put_derived_artifact", derived_request
+        )
+        assert not failed, derived_again
+        assert derived_again["reused"] is True
+        assert derived_again["artifact_id"] == derived["artifact_id"]
 
         refused, failed = session.tool(
             "chutni_put_artifacts",
@@ -481,6 +554,28 @@ def main():
         assert not failed, stored
         assert stored["artifact_id"]
         assert stored["semantic_validation"] == "not_performed"
+
+        stored_again, failed = session.tool(
+            "chutni_put_model_artifact",
+            {
+                "store_path": str(store),
+                "source_path": str(note),
+                "text": "The note describes adaptive camouflage.",
+                "artifact_kind": "summary_short",
+                "model_id": "example/local-model",
+                "model_revision": "revision-1",
+                "runtime": "test-runtime",
+                "app_name": "test-host",
+                "app_version": "1.0",
+                "operation": "summarize",
+                "recipe_hash": "recipe:test-v1",
+                "parameters": {"max_tokens": 64},
+                "confirmed": True,
+            },
+        )
+        assert not failed, stored_again
+        assert stored_again["reused"] is True
+        assert stored_again["artifact_id"] == stored["artifact_id"]
 
         summary, failed = session.tool(
             "chutni_search",

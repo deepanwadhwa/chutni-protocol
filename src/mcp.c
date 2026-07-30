@@ -65,6 +65,12 @@ static int argument_bool(const cj *arguments, const char *key,
     return value && value->type == CJ_BOOL ? value->bval : default_value;
 }
 
+static int argument_int(const cj *arguments, const char *key,
+                        int default_value) {
+    cj *value = cj_get(arguments, key);
+    return value && value->type == CJ_NUM ? (int)value->num : default_value;
+}
+
 static cj *tool_error(const char *code, const char *message) {
     cj *result = cj_obj();
     if (!result) return NULL;
@@ -275,6 +281,30 @@ static void set_scan_result(cj *object, const chutni_scan_result *scan) {
     cj_set(object, "scan", value);
 }
 
+static void report_scan_progress(const chutni_scan_result *scan,
+                                 const char *current_path, void *userdata) {
+    FILE *stream = userdata ? (FILE *)userdata : stderr;
+    cj *event = cj_obj();
+    if (!event) return;
+    cj_set(event, "type", cj_str("scan_progress"));
+    cj_set(event, "files_seen", cj_num((double)scan->files_seen));
+    cj_set(event, "sources_indexed", cj_num((double)scan->sources_indexed));
+    cj_set(event, "unchanged", cj_num((double)scan->unchanged));
+    cj_set(event, "text_artifacts", cj_num((double)scan->text_artifacts));
+    cj_set(event, "metadata_artifacts",
+           cj_num((double)scan->metadata_artifacts));
+    cj_set(event, "skipped", cj_num((double)scan->skipped));
+    cj_set(event, "errors", cj_num((double)scan->errors));
+    if (current_path)
+        cj_set(event, "current_path", cj_str(current_path));
+    char *line = cj_dump(event, -1);
+    cj_free(event);
+    if (!line) return;
+    fprintf(stream, "%s\n", line);
+    fflush(stream);
+    free(line);
+}
+
 static int set_store_counts(cj *object, chutni_store *store) {
     chutni_counts counts;
     if (chutni_store_counts(store, &counts) != CHUTNI_OK) return 0;
@@ -296,6 +326,14 @@ static int set_store_counts(cj *object, chutni_store *store) {
     cj_set(value, "objects", cj_num((double)counts.objects));
     cj_set(value, "producers", cj_num((double)counts.producers));
     cj_set(value, "derivations", cj_num((double)counts.derivations));
+    cj_set(value, "content_artifacts",
+           cj_num((double)counts.content_artifacts));
+    cj_set(value, "metadata_artifacts",
+           cj_num((double)counts.metadata_artifacts));
+    cj_set(value, "content_readable_sources",
+           cj_num((double)counts.content_readable_sources));
+    cj_set(value, "metadata_only_sources",
+           cj_num((double)counts.metadata_only_sources));
     cj_set(object, "counts", value);
     return 1;
 }
@@ -381,6 +419,10 @@ static cj *tool_folder_activate(const cj *arguments, int *is_error) {
     cj *max_value = cj_get(arguments, "max_file_size_bytes");
     if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
         options.max_file_size_bytes = (uint64_t)max_value->num;
+    if (argument_bool(arguments, "report_progress", 0)) {
+        options.progress_callback = report_scan_progress;
+        options.progress_userdata = stderr;
+    }
     chutni_scan_result scan;
     status = chutni_scan(store, &options, &scan);
     if (status != CHUTNI_OK) {
@@ -473,6 +515,155 @@ static cj *tool_store_info(const cj *arguments, int *is_error) {
     return result;
 }
 
+/* Applications need a bounded file inventory for enrichment and for
+ * inventory-shaped questions that lexical search cannot answer. Hierarchical
+ * Chutni stores also contain directory sources; those are excluded here so
+ * existing hosts see the same file-only contract they used before v0.2. */
+static cj *tool_list_sources(const cj *arguments, int *is_error) {
+    const char *store_path = argument_string(arguments, "store_path");
+    const char *source_path = argument_string(arguments, "source_path");
+    if (!store_path || !source_path || !*source_path) {
+        *is_error = 1;
+        return tool_error(
+            "invalid_arguments",
+            "store_path and the selected source_path are required.");
+    }
+    chutni_store *store = NULL;
+    chutni_status status = chutni_open(store_path, 1, &store);
+    if (status != CHUTNI_OK) {
+        *is_error = 1;
+        return status_error("Cannot open store for source listing", status,
+                            NULL);
+    }
+    char root_id[CHUTNI_ID_STRLEN];
+    if (!root_matches_source(store, source_path, root_id)) {
+        chutni_close(store);
+        *is_error = 1;
+        return tool_error(
+            "root_not_authorized",
+            "The selected source path is not an authorized root in this store.");
+    }
+    chutni_source_info *sources = NULL;
+    size_t source_count = 0;
+    status = chutni_sources_list(store, root_id, &sources, &source_count);
+    if (status != CHUTNI_OK) {
+        cj *error = status_error("Cannot list store sources", status, store);
+        chutni_close(store);
+        *is_error = 1;
+        return error;
+    }
+
+    size_t file_count = 0;
+    for (size_t i = 0; i < source_count; ++i)
+        if (!sources[i].source_kind ||
+            !strcmp(sources[i].source_kind, "file"))
+            file_count++;
+
+    int limit = argument_int(arguments, "limit", 50);
+    if (limit < 1) limit = 1;
+    if (limit > 200) limit = 200;
+    int offset_value = argument_int(arguments, "offset", 0);
+    if (offset_value < 0) offset_value = 0;
+    size_t offset =
+        (size_t)offset_value < file_count ? (size_t)offset_value : file_count;
+    size_t wanted =
+        file_count - offset < (size_t)limit ? file_count - offset : (size_t)limit;
+
+    cj *result = cj_obj();
+    cj_set(result, "ok", cj_bool(1));
+    cj_set(result, "store_path", cj_str(store_path));
+    cj_set(result, "source_path", cj_str(source_path));
+    cj_set(result, "count", cj_num((double)file_count));
+    cj_set(result, "offset", cj_num((double)offset));
+    cj_set(result, "returned", cj_num((double)wanted));
+    cj_set(result, "truncated", cj_bool(offset + wanted < file_count));
+    cj *items = cj_arr();
+    size_t seen_files = 0, returned = 0;
+    for (size_t i = 0; i < source_count && returned < wanted; ++i) {
+        if (sources[i].source_kind &&
+            strcmp(sources[i].source_kind, "file"))
+            continue;
+        if (seen_files++ < offset) continue;
+        cj *item = cj_obj();
+        if (sources[i].source_id)
+            cj_set(item, "source_id", cj_str(sources[i].source_id));
+        if (sources[i].display_path)
+            cj_set(item, "display_path", cj_str(sources[i].display_path));
+        if (sources[i].media_type)
+            cj_set(item, "media_type", cj_str(sources[i].media_type));
+        if (sources[i].state)
+            cj_set(item, "state", cj_str(sources[i].state));
+        cj_set(item, "size_bytes", cj_num((double)sources[i].size_bytes));
+        cj_push(items, item);
+        returned++;
+    }
+    cj_set(result, "sources", items);
+    chutni_source_info_free(sources, source_count);
+    chutni_close(store);
+    return result;
+}
+
+static char *json_value_text(const cj *value) {
+    return value ? cj_dump(value, -1) : NULL;
+}
+
+/* Find the active artifact produced by the same operation for the same
+ * source slice. Exact repeats are reused; changed output supersedes the prior
+ * artifact. This makes refresh safe and bounded for native host integrations. */
+static char *matching_current_artifact(
+    chutni_store *store, const char *source_id, const char *artifact_kind,
+    const char *producer_name, const char *producer_kind,
+    const char *model_id, const char *model_revision, const char *operation,
+    const char *source_hash, const char *selector_json, const char *text,
+    int *reused) {
+    *reused = 0;
+    chutni_artifact_info *artifacts = NULL;
+    size_t count = 0;
+    if (chutni_list_artifacts(store, source_id, &artifacts, &count) != CHUTNI_OK)
+        return NULL;
+    char *prior = NULL;
+    for (size_t i = 0; i < count; ++i) {
+        chutni_artifact_info *item = &artifacts[i];
+        if (!item->status || strcmp(item->status, "active") ||
+            !item->artifact_kind || strcmp(item->artifact_kind, artifact_kind) ||
+            !item->producer_name || strcmp(item->producer_name, producer_name) ||
+            !item->producer_kind || strcmp(item->producer_kind, producer_kind) ||
+            !item->operation || strcmp(item->operation, operation))
+            continue;
+        if (model_id && (!item->model_id || strcmp(item->model_id, model_id)))
+            continue;
+        if (model_revision &&
+            (!item->model_revision ||
+             strcmp(item->model_revision, model_revision)))
+            continue;
+        if ((selector_json || item->selector_json) &&
+            (!selector_json || !item->selector_json ||
+             strcmp(item->selector_json, selector_json)))
+            continue;
+        free(prior);
+        prior = item->artifact_id ? strdup(item->artifact_id) : NULL;
+        if (item->inline_text && !strcmp(item->inline_text, text) &&
+            item->source_content_hash &&
+            !strcmp(item->source_content_hash, source_hash)) {
+            *reused = 1;
+            break;
+        }
+    }
+    chutni_artifact_info_free(artifacts, count);
+    return prior;
+}
+
+static cj *reused_artifact_json(const char *store_path, const char *source_id,
+                                const char *artifact_id) {
+    cj *result = cj_obj();
+    cj_set(result, "ok", cj_bool(1));
+    cj_set(result, "reused", cj_bool(1));
+    cj_set(result, "store_path", cj_str(store_path));
+    cj_set(result, "source_id", cj_str(source_id));
+    cj_set(result, "artifact_id", cj_str(artifact_id));
+    return result;
+}
+
 static cj *tool_scan(const cj *arguments, int *is_error) {
     if (!argument_bool(arguments, "confirmed", 0)) {
         *is_error = 1;
@@ -485,6 +676,45 @@ static cj *tool_scan(const cj *arguments, int *is_error) {
     if (status != CHUTNI_OK) {
         *is_error = 1;
         return status_error("Cannot open store for scanning", status, NULL);
+    }
+    if (argument_bool(arguments, "report_progress", 0)) {
+        chutni_scan_options options;
+        memset(&options, 0, sizeof options);
+        options.app_name = argument_string(arguments, "app_name");
+        options.app_version = argument_string(arguments, "app_version");
+        options.progress_callback = report_scan_progress;
+        options.progress_userdata = stderr;
+        cj *max_value = cj_get(arguments, "max_file_size_bytes");
+        if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
+            options.max_file_size_bytes = (uint64_t)max_value->num;
+        cj *depth_value = cj_get(arguments, "max_depth");
+        if (depth_value && depth_value->type == CJ_NUM &&
+            depth_value->num >= 0) {
+            options.override_max_depth = (int)depth_value->num;
+            options.use_override_max_depth = 1;
+        }
+        chutni_scan_result scan;
+        status = chutni_scan(store, &options, &scan);
+        if (status != CHUTNI_OK) {
+            cj *error = status_error("Store scan failed", status, store);
+            chutni_close(store);
+            *is_error = 1;
+            return error;
+        }
+        cj *result = cj_obj();
+        cj_set(result, "ok", cj_bool(1));
+        cj_set(result, "store_path", cj_str(chutni_store_path(store)));
+        set_scan_result(result, &scan);
+        if (!set_store_counts(result, store)) {
+            cj_free(result);
+            cj *error = status_error(
+                "Cannot read store counts", CHUTNI_ERR_DB, store);
+            chutni_close(store);
+            *is_error = 1;
+            return error;
+        }
+        chutni_close(store);
+        return result;
     }
     cj *result = jcall_dispatch(store, "scan", arguments, is_error);
     chutni_close(store);
@@ -762,6 +992,134 @@ static cj *tool_put_artifacts(const cj *arguments, int *is_error) {
     return result;
 }
 
+/* Compatibility convenience for native hosts such as Samosa. It resolves
+ * and verifies the source, then maps the old single-artifact request onto the
+ * generic provenance-complete batch operation. */
+static cj *tool_put_derived_artifact(const cj *arguments, int *is_error) {
+    if (!argument_bool(arguments, "confirmed", 0)) {
+        *is_error = 1;
+        return tool_error(
+            "confirmation_required",
+            "The host must confirm that this derived output should become reusable memory.");
+    }
+    const char *store_path = argument_string(arguments, "store_path");
+    const char *source_path = argument_string(arguments, "source_path");
+    const char *text = argument_string(arguments, "text");
+    const char *artifact_kind = argument_string(arguments, "artifact_kind");
+    const char *producer_name = argument_string(arguments, "producer_name");
+    const char *producer_version =
+        argument_string(arguments, "producer_version");
+    const char *app_name = argument_string(arguments, "app_name");
+    const char *app_version = argument_string(arguments, "app_version");
+    if (!store_path || !source_path || !text || !artifact_kind ||
+        !producer_name || !producer_version || !app_name || !app_version) {
+        *is_error = 1;
+        return tool_error(
+            "invalid_arguments",
+            "store_path, source_path, text, artifact_kind, producer_name, producer_version, app_name, and app_version are required.");
+    }
+
+    chutni_store *store = NULL;
+    chutni_status status = chutni_open(store_path, 0, &store);
+    if (status != CHUTNI_OK) {
+        *is_error = 1;
+        return status_error("Cannot open store for artifact write", status,
+                            NULL);
+    }
+    source_snapshot source;
+    status = source_snapshot_load(store, arguments, &source);
+    const char *freshness = NULL;
+    if (status == CHUTNI_OK)
+        status = chutni_source_refresh(store, source.source_id, &freshness);
+    if (status == CHUTNI_OK)
+        status = source_snapshot_load(store, arguments, &source);
+    if (status != CHUTNI_OK || !freshness ||
+        strcmp(freshness, "current") || !source.content_hash[0]) {
+        cj *error = tool_error(
+            "source_not_current",
+            "The source is missing or changed; scan it before storing derived output.");
+        chutni_close(store);
+        *is_error = 1;
+        return error;
+    }
+
+    const char *operation = argument_string(arguments, "operation")
+                                ? argument_string(arguments, "operation")
+                                : "derive_artifact";
+    const char *producer_kind = argument_string(arguments, "producer_kind")
+                                    ? argument_string(arguments, "producer_kind")
+                                    : "parser";
+    char *selector_text = json_value_text(cj_get(arguments, "selector"));
+    int reused = 0;
+    char *prior = matching_current_artifact(
+        store, source.source_id, artifact_kind, producer_name, producer_kind,
+        NULL, NULL, operation, source.content_hash, selector_text, text,
+        &reused);
+    free(selector_text);
+    if (reused && prior) {
+        cj *result =
+            reused_artifact_json(store_path, source.source_id, prior);
+        free(prior);
+        chutni_close(store);
+        return result;
+    }
+    chutni_close(store);
+
+    cj *batch = cj_obj();
+    cj_set(batch, "store_path", cj_str(store_path));
+    cj_set(batch, "source_path", cj_str(source_path));
+    cj_set(batch, "source_content_hash", cj_str(source.content_hash));
+    cj_set(batch, "confirmed", cj_bool(1));
+    cj_set(batch, "operation", cj_str(operation));
+    const char *recipe_hash = argument_string(arguments, "recipe_hash");
+    if (recipe_hash) cj_set(batch, "recipe_hash", cj_str(recipe_hash));
+    cj *parameters = cj_get(arguments, "parameters");
+    if (parameters) cj_set(batch, "parameters", json_clone(parameters));
+
+    cj *producer = cj_obj();
+    cj_set(producer, "producer_kind", cj_str(producer_kind));
+    cj_set(producer, "name", cj_str(producer_name));
+    cj_set(producer, "version", cj_str(producer_version));
+    const char *runtime = argument_string(arguments, "runtime");
+    if (runtime) cj_set(producer, "runtime", cj_str(runtime));
+    cj_set(producer, "app_name", cj_str(app_name));
+    cj_set(producer, "app_version", cj_str(app_version));
+    cj_set(batch, "producer", producer);
+
+    cj *items = cj_arr();
+    cj *item = cj_obj();
+    cj_set(item, "artifact_kind", cj_str(artifact_kind));
+    cj_set(item, "artifact_origin", cj_str("deterministic_transform"));
+    cj_set(item, "text", cj_str(text));
+    const char *media_type = argument_string(arguments, "media_type");
+    if (media_type) cj_set(item, "media_type", cj_str(media_type));
+    cj *selector = cj_get(arguments, "selector");
+    if (selector) cj_set(item, "selector", json_clone(selector));
+    const char *explicit_supersedes =
+        argument_string(arguments, "supersedes_artifact_id");
+    if (explicit_supersedes)
+        cj_set(item, "supersedes_artifact_id",
+               cj_str(explicit_supersedes));
+    else if (prior)
+        cj_set(item, "supersedes_artifact_id", cj_str(prior));
+    cj_push(items, item);
+    cj_set(batch, "artifacts", items);
+    free(prior);
+
+    cj *result = tool_put_artifacts(batch, is_error);
+    cj_free(batch);
+    if (!*is_error && result) {
+        cj *written = cj_get(result, "artifacts");
+        if (written && written->type == CJ_ARR && written->n == 1) {
+            const char *artifact_id =
+                argument_string(written->items[0], "artifact_id");
+            if (artifact_id)
+                cj_set(result, "artifact_id", cj_str(artifact_id));
+        }
+    }
+    return result;
+}
+
 static cj *tool_source_context(const cj *arguments, int *is_error) {
     const char *store_path = argument_string(arguments, "store_path");
     if (!store_path ||
@@ -819,7 +1177,57 @@ static cj *tool_put_model_artifact(const cj *arguments, int *is_error) {
         return status_error("Cannot open store for artifact write", status,
                             NULL);
     }
-    cj *result = jcall_dispatch(store, "put_model_artifact", arguments, is_error);
+
+    source_snapshot source;
+    status = source_snapshot_load(store, arguments, &source);
+    const char *freshness = NULL;
+    if (status == CHUTNI_OK)
+        status = chutni_source_refresh(store, source.source_id, &freshness);
+    if (status == CHUTNI_OK)
+        status = source_snapshot_load(store, arguments, &source);
+    if (status != CHUTNI_OK || !freshness ||
+        strcmp(freshness, "current") || !source.content_hash[0]) {
+        cj *error = tool_error(
+            "source_not_current",
+            "The source is missing or changed; scan it before storing model output.");
+        chutni_close(store);
+        *is_error = 1;
+        return error;
+    }
+
+    const char *artifact_kind = argument_string(arguments, "artifact_kind")
+                                    ? argument_string(arguments, "artifact_kind")
+                                    : "summary_short";
+    const char *producer_name = argument_string(arguments, "producer_name")
+                                    ? argument_string(arguments, "producer_name")
+                                    : argument_string(arguments, "model_id");
+    const char *operation = argument_string(arguments, "operation")
+                                ? argument_string(arguments, "operation")
+                                : "generate_artifact";
+    char *selector_text = json_value_text(cj_get(arguments, "selector"));
+    int reused = 0;
+    char *prior = matching_current_artifact(
+        store, source.source_id, artifact_kind, producer_name, "model",
+        argument_string(arguments, "model_id"),
+        argument_string(arguments, "model_revision"), operation,
+        source.content_hash, selector_text, argument_string(arguments, "text"),
+        &reused);
+    free(selector_text);
+    if (reused && prior) {
+        cj *result =
+            reused_artifact_json(store_path, source.source_id, prior);
+        free(prior);
+        chutni_close(store);
+        return result;
+    }
+
+    cj *write_arguments = json_clone(arguments);
+    if (prior && !argument_string(arguments, "supersedes_artifact_id"))
+        cj_set(write_arguments, "supersedes_artifact_id", cj_str(prior));
+    free(prior);
+    cj *result =
+        jcall_dispatch(store, "put_model_artifact", write_arguments, is_error);
+    cj_free(write_arguments);
     if (!*is_error) cj_set(result, "store_path", cj_str(store_path));
     chutni_close(store);
     return result;
@@ -843,6 +1251,8 @@ static cj *dispatch_tool(const char *name, const cj *arguments, int *is_error) {
         result = tool_capabilities(arguments, is_error);
     else if (name && !strcmp(name, "chutni_store_info"))
         result = tool_store_info(arguments, is_error);
+    else if (name && !strcmp(name, "chutni_list_sources"))
+        result = tool_list_sources(arguments, is_error);
     else if (name && !strcmp(name, "chutni_scan"))
         result = tool_scan(arguments, is_error);
     else if (name && !strcmp(name, "chutni_search"))
@@ -855,6 +1265,8 @@ static cj *dispatch_tool(const char *name, const cj *arguments, int *is_error) {
         result = tool_coverage(arguments, is_error);
     else if (name && !strcmp(name, "chutni_source_context"))
         result = tool_source_context(arguments, is_error);
+    else if (name && !strcmp(name, "chutni_put_derived_artifact"))
+        result = tool_put_derived_artifact(arguments, is_error);
     else if (name && !strcmp(name, "chutni_put_artifacts"))
         result = tool_put_artifacts(arguments, is_error);
     else if (name && !strcmp(name, "chutni_put_model_artifact"))
@@ -990,6 +1402,22 @@ static cj *tools_list(void) {
         cj *properties = cj_obj();
         cj_set(properties, "store_path",
                schema_string("Absolute path to a .chutni store."));
+        cj_set(properties, "source_path",
+               schema_string("Exact authorized source root whose indexed files may be listed."));
+        cj_set(properties, "limit",
+               schema_integer("Maximum number of file records returned.", 1, 200));
+        cj_set(properties, "offset",
+               schema_integer("Zero-based file-record offset for pagination.", 0, -1));
+        const char *required[] = {"store_path", "source_path", NULL};
+        cj_push(tools, tool_definition(
+            "chutni_list_sources", "List indexed Chutni files",
+            "Return a bounded file-only inventory for one exact authorized source root without walking the live filesystem.",
+            input_schema(properties, required), 1, 0, 1));
+    }
+    {
+        cj *properties = cj_obj();
+        cj_set(properties, "store_path",
+               schema_string("Absolute path to a .chutni store."));
         cj_set(properties, "confirmed",
                schema_boolean("Must be true after the user requests or approves the rescan."));
         cj_set(properties, "app_name",
@@ -1089,6 +1517,54 @@ static cj *tools_list(void) {
             "chutni_source_context", "Read all interpretations of a source",
             "Return a source and its current artifacts together, including creation time, selectors, processing operation, producer/model/application provenance, and an explicit statement that Chutni did not verify semantic truth.",
             input_schema(properties, required), 1, 0, 1));
+    }
+    {
+        cj *properties = cj_obj();
+        cj_set(properties, "store_path",
+               schema_string("Absolute path to a .chutni store."));
+        cj_set(properties, "source_path",
+               schema_string("Absolute path of a source already indexed in the store."));
+        cj_set(properties, "text",
+               schema_string("Deterministically derived artifact text to retain."));
+        cj_set(properties, "artifact_kind",
+               schema_string("Core or namespaced artifact kind."));
+        cj_set(properties, "media_type",
+               schema_string("Artifact media type; defaults to UTF-8 text."));
+        cj_set(properties, "producer_kind",
+               schema_string("Protocol producer kind; defaults to parser."));
+        cj_set(properties, "producer_name",
+               schema_string("Human-readable parser or pipeline name."));
+        cj_set(properties, "producer_version",
+               schema_string("Exact parser or pipeline version/fingerprint."));
+        cj_set(properties, "runtime",
+               schema_string("Runtime used for deterministic extraction."));
+        cj_set(properties, "app_name",
+               schema_string("Host application committing the artifact."));
+        cj_set(properties, "app_version",
+               schema_string("Host application version."));
+        cj_set(properties, "operation",
+               schema_string("Derivation operation; defaults to derive_artifact."));
+        cj_set(properties, "recipe_hash",
+               schema_string("Hash or stable identifier for the deterministic recipe."));
+        cj *parameters = cj_obj();
+        cj_set(parameters, "type", cj_str("object"));
+        cj_set(properties, "parameters", parameters);
+        cj *selector = cj_obj();
+        cj_set(selector, "type", cj_str("object"));
+        cj_set(properties, "selector", selector);
+        cj_set(properties, "supersedes_artifact_id",
+               schema_string("Optional prior artifact superseded by this one."));
+        cj_set(properties, "confirmed",
+               schema_boolean("Must be true when the host intends to retain this derived output."));
+        const char *required[] = {
+            "store_path", "source_path", "text", "artifact_kind",
+            "producer_name", "producer_version", "app_name", "app_version",
+            "confirmed", NULL
+        };
+        cj_push(tools, tool_definition(
+            "chutni_put_derived_artifact", "Store derived artifact",
+            "Commit deterministic parser or OCR output with exact source freshness, producer identity, selectors, and provenance.",
+            input_schema(properties, required), 0, 0, 0));
     }
     {
         cj *properties = cj_obj();

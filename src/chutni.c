@@ -1260,6 +1260,44 @@ chutni_status chutni_store_counts(chutni_store *s, chutni_counts *c) {
         "SELECT COUNT(*) FROM sources WHERE source_kind='directory'"
         " AND json_extract(metadata_json,'$.observation')='opaque'");
     c->relations = scalar(s, "SELECT COUNT(*) FROM relations");
+
+    /* Application-facing readability counters. Keep this vocabulary aligned
+       with the kinds search can return as reusable document content. Scan
+       structure artifacts are deliberately excluded. */
+    const char *content_kinds =
+        "'extracted_text','page_text','ocr_text','transcript','text_chunk',"
+        "'summary_short','summary_long','image_caption','document_title',"
+        "'keywords','entities','table_schema','sheet_summary','archive_listing'";
+    char sql[1024];
+    snprintf(sql, sizeof sql,
+             "SELECT COUNT(*) FROM artifacts a JOIN sources s USING(source_id) "
+             "WHERE a.status='active' "
+             "AND COALESCE(s.source_kind,'file')='file' "
+             "AND a.artifact_kind IN (%s)", content_kinds);
+    c->content_artifacts = scalar(s, sql);
+    c->metadata_artifacts = scalar(
+        s, "SELECT COUNT(*) FROM artifacts a JOIN sources s USING(source_id) "
+           "WHERE a.status='active' "
+           "AND COALESCE(s.source_kind,'file')='file' "
+           "AND a.artifact_kind='file_metadata'");
+    snprintf(sql, sizeof sql,
+             "SELECT COUNT(DISTINCT a.source_id) "
+             "FROM artifacts a JOIN sources s USING(source_id) "
+             "WHERE a.status='active' "
+             "AND COALESCE(s.source_kind,'file')='file' "
+             "AND a.artifact_kind IN (%s)", content_kinds);
+    c->content_readable_sources = scalar(s, sql);
+    snprintf(sql, sizeof sql,
+             "SELECT COUNT(*) FROM sources s "
+             "WHERE COALESCE(s.source_kind,'file')='file' "
+             "AND EXISTS (SELECT 1 FROM artifacts a "
+             "            WHERE a.source_id=s.source_id AND a.status='active') "
+             "AND NOT EXISTS (SELECT 1 FROM artifacts a "
+             "                WHERE a.source_id=s.source_id "
+             "                AND a.status='active' "
+             "                AND a.artifact_kind IN (%s))",
+             content_kinds);
+    c->metadata_only_sources = scalar(s, sql);
     return CHUTNI_OK;
 }
 
@@ -3893,6 +3931,12 @@ static int jcall_set_counts(cj *obj, chutni_store *s) {
     cj_set(v, "objects", cj_num((double)c.objects));
     cj_set(v, "producers", cj_num((double)c.producers));
     cj_set(v, "derivations", cj_num((double)c.derivations));
+    cj_set(v, "content_artifacts", cj_num((double)c.content_artifacts));
+    cj_set(v, "metadata_artifacts", cj_num((double)c.metadata_artifacts));
+    cj_set(v, "content_readable_sources",
+           cj_num((double)c.content_readable_sources));
+    cj_set(v, "metadata_only_sources",
+           cj_num((double)c.metadata_only_sources));
     cj_set(obj, "counts", v);
     return 1;
 }

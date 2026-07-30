@@ -373,6 +373,11 @@ chutni_status chutni_new_id(char id[CHUTNI_ID_STRLEN]);
  * file_metadata artifacts rather than fabricated extraction.
  */
 
+struct chutni_scan_result;
+typedef void (*chutni_scan_progress_callback)(
+    const struct chutni_scan_result *progress, const char *current_path,
+    void *userdata);
+
 typedef struct {
     /* Zero selects the reference scanner's 64 MiB safety cap. */
     uint64_t max_file_size_bytes;
@@ -386,9 +391,13 @@ typedef struct {
      * which is what a host should normally do. */
     int  override_max_depth;
     int  use_override_max_depth;
+    /* Optional monitoring observer called after every regular file. It
+     * cannot alter policy or cancel the scan. Appended for ABI stability. */
+    chutni_scan_progress_callback progress_callback;
+    void *progress_userdata;
 } chutni_scan_options;
 
-typedef struct {
+typedef struct chutni_scan_result {
     uint64_t files_seen;
     uint64_t sources_indexed;
     uint64_t unchanged;
@@ -501,6 +510,12 @@ typedef struct {
      * consumer nothing about how much of a tree was actually opened. */
     int64_t sources_files, sources_directories, sources_opaque_directories;
     int64_t relations;
+    /* Active reusable text and per-file readability. These compatibility
+     * counters are intentionally file-only: directory listings and coverage
+     * manifests describe scan structure, not files an application can enrich
+     * or quote as document content. */
+    int64_t content_artifacts, metadata_artifacts;
+    int64_t content_readable_sources, metadata_only_sources;
 } chutni_counts;
 
 chutni_status chutni_store_counts(chutni_store *store, chutni_counts *out);

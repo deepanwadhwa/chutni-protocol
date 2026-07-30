@@ -49,6 +49,8 @@ typedef struct {
     char derivation_coverage[CHUTNI_ID_STRLEN];
     chutni_scan_result *result;
     uint64_t max_bytes;
+    chutni_scan_progress_callback progress_callback;
+    void *progress_userdata;
 } scan_context;
 
 static int looks_texty(const char *path) {
@@ -119,14 +121,14 @@ static void scan_file(scan_context *sc, const char *path, int depth,
             sc->result->errors++;
         }
         sc->result->skipped++;
-        return;
+        goto done;
     }
 
     int changed = 0;
     if (chutni_source_put(sc->store, sc->root_id, path, 1, source_id,
                           &changed) != CHUTNI_OK) {
         sc->result->errors++;
-        return;
+        goto done;
     }
     sc->result->sources_indexed++;
     sc->result->files_hashed++;
@@ -134,7 +136,7 @@ static void scan_file(scan_context *sc, const char *path, int depth,
     char content_hash[CHUTNI_HASH_STRLEN];
     if (chutni_hash_file(path, content_hash) != CHUTNI_OK) {
         sc->result->errors++;
-        return;
+        goto done;
     }
 
     int need_metadata = 1;
@@ -160,7 +162,7 @@ static void scan_file(scan_context *sc, const char *path, int depth,
             }
         }
         chutni_artifact_info_free(existing, existing_count);
-        if (!need_metadata && !need_text) return;
+        if (!need_metadata && !need_text) goto done;
     }
 
     char artifact_id[CHUTNI_ID_STRLEN];
@@ -184,7 +186,7 @@ static void scan_file(scan_context *sc, const char *path, int depth,
             sc->result->errors++;
     }
 
-    if (!need_text) return;
+    if (!need_text) goto done;
 
     char *text = NULL;
     FILE *file = fopen(path, "rb");
@@ -218,6 +220,9 @@ static void scan_file(scan_context *sc, const char *path, int depth,
             sc->result->errors++;
         free(text);
     }
+done:
+    if (sc->progress_callback)
+        sc->progress_callback(sc->result, path, sc->progress_userdata);
 }
 
 /* ------------------------------------------------------------- directories */
@@ -681,6 +686,8 @@ static chutni_status scan_one_root(chutni_store *store, const chutni_root_info *
     sc.max_bytes = options && options->max_file_size_bytes
                        ? options->max_file_size_bytes
                        : DEFAULT_MAX_FILE_BYTES;
+    sc.progress_callback = options ? options->progress_callback : NULL;
+    sc.progress_userdata = options ? options->progress_userdata : NULL;
     sc.max_depth = effective_max_depth(root->policy_json, options, &sc.policy);
     result->deepest_directory_enumerated = 0;
 
@@ -807,6 +814,8 @@ chutni_status chutni_observe_directory(chutni_store *store, const char *source_i
     sc.max_bytes = options && options->max_file_size_bytes
                        ? options->max_file_size_bytes
                        : DEFAULT_MAX_FILE_BYTES;
+    sc.progress_callback = options ? options->progress_callback : NULL;
+    sc.progress_userdata = options ? options->progress_userdata : NULL;
     effective_max_depth(owner->policy_json, options, &sc.policy);
     /* Owned by this frame: `owner` points into `roots`, which is released
        before the walk begins. */
