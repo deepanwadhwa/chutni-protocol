@@ -167,7 +167,25 @@ static char *parse_string_raw(P *s) {
     size_t len = 0, cap = 0;
     while (*s->p && *s->p != '"') {
         unsigned cp;
-        if (*s->p == '\\') {
+        if (*s->p != '\\') {
+            /* JSON text is UTF-8. Preserve an already encoded multibyte
+             * sequence byte-for-byte; feeding each byte through utf8_emit
+             * would encode it a second time (for example, č -> Ä). */
+            if (len + 2 > cap) {
+                size_t c = cap ? cap * 2 : 32;
+                while (len + 2 > c) c *= 2;
+                char *t = realloc(out, c);
+                if (!t) {
+                    s->err = "out of memory";
+                    free(out);
+                    return NULL;
+                }
+                out = t;
+                cap = c;
+            }
+            out[len++] = *s->p++;
+            continue;
+        } else {
             s->p++;
             switch (*s->p) {
             case '"':  cp = '"';  s->p++; break;
@@ -199,8 +217,6 @@ static char *parse_string_raw(P *s) {
             }
             default: s->err = "bad escape"; free(out); return NULL;
             }
-        } else {
-            cp = (unsigned char)*s->p++;
         }
         if (!utf8_emit(&out, &len, &cap, cp)) { s->err = "out of memory"; free(out); return NULL; }
     }
