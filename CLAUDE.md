@@ -1,16 +1,17 @@
 # Chutni — agent guide
 
-Open protocol for portable, source-backed AI memory over a user's local files,
-plus a reference implementation in portable C99. No package manager, no
-dependencies to install, no build system beyond `make`.
+Open protocol for portable, provenance-bearing file and standalone application
+memory, plus a reference implementation in portable C99. No package manager,
+no dependencies to install, no build system beyond `make`.
 
 ## Start here
 
 1. **[SPEC.md](SPEC.md)** is the protocol, version 0.2-draft. It is the source
    of truth. Section numbers (§8, §13.3, §39) are referenced throughout the
-   code and this document — use them. v0.2 added hierarchical sources and
-   bounded coverage (§11.1, §12.5, §13.5, §15.5–§15.7, §24.4, §35.1); v0.1
-   stores stay readable and are not rewritten on open.
+   code and this document — use them. v0.2 added hierarchical sources,
+   bounded coverage, and standalone memory (§11.1, §12.5–§12.6, §13.5,
+   §15.5–§15.7, §24.4, §35.1); v0.1 stores stay readable and are not
+   rewritten on open.
 2. **[docs/TASKS.md](docs/TASKS.md)** is what is built, what is not, and what
    to work on next.
 3. **[docs/evidence/](docs/evidence/)** holds test transcripts. Claims about
@@ -68,7 +69,7 @@ Every command accepts `--json`; agents are the primary consumers.
 | `src/cj.{c,h}` | JSON document model (a DOM, not an extractor — see below) |
 | `src/cli.c` | the `chutni` command |
 | `tests/conformance/` | §31 scenarios, C API level and CLI level |
-| `docs/tickets/` | the adoption track, T01–T15; index maps tickets to TASKS.md phases |
+| `docs/tickets/` | archived T01–T15 design history; not the active queue |
 | `skills/` | drop-in instructions teaching an agent to use a store |
 | `third_party/` | BLAKE3 and SQLite, vendored, compiled from source, unmodified |
 

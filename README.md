@@ -1,15 +1,16 @@
 # Chutni
 
-**Prepare a user's files for AI once. Keep the result. Let any application reuse it.**
+**Keep useful knowledge and LLM work. Let another application reuse it.**
 
-Chutni is an open protocol for AI-readable memory derived from a user's local
-files, plus a reference implementation in portable C.
+Chutni is an open protocol and portable C implementation for AI-readable
+memory. It retains both work derived from a user's local files and standalone
+notes, decisions, plans, conversation summaries, analyses, and other useful
+application/model outputs.
 
-A Chutni store records where files are, what they contain, **who or what
-produced each description**, and whether that description is still valid for the
-file's current bytes. It is deliberately not tied to one application, one model,
-or one operating system: a store built by one program can be read, searched, and
-improved by another.
+A Chutni store records content, **who or what produced it**, what inputs were
+used, and whether it is still current. It is deliberately not tied to one
+application or model: a store written by one program can be read, searched,
+and improved by another.
 
 - **Specification:** [SPEC.md](SPEC.md) (version 0.2-draft; v0.1 stores remain readable)
 - **This implementation:** `0.2.0` — see [VERSION](VERSION). The release version
@@ -39,6 +40,7 @@ Honest summary of what runs today, on one machine (macOS 15 / arm64, Apple M3).
 | Freshness and staleness (§13.2–§13.3) | built, tested; search uses a cheap stat downgrade |
 | Supersession and multi-producer artifacts (§23) | built, tested |
 | Generic host artifact batches and grouped source context | built, tested |
+| Standalone application/model memory (notes, decisions, plans, summaries) | built, tested |
 | Single-writer/many-reader application coordination | built, tested across processes |
 | Lexical search, FTS5 (§19) | built, tested |
 | Store discovery and registry (§39) | built, tested |
@@ -63,8 +65,10 @@ Honest summary of what runs today, on one machine (macOS 15 / arm64, Apple M3).
 counting them as passes. Verified only on macOS 15 / arm64 (Apple M3) — the
 only machine this has run on. See
 [docs/evidence/](docs/evidence/2026-07-30-v0.2-hierarchical-coverage/report.md)
-for what that does and does not cover, and [docs/TASKS.md](docs/TASKS.md) for
-the work list.
+for what that does and does not cover, [docs/TASKS.md](docs/TASKS.md) for the
+current completion state, and
+[docs/SAMOSA-COMPATIBILITY.md](docs/SAMOSA-COMPATIBILITY.md) for the pinned
+application boundary.
 
 ## Build
 
@@ -164,11 +168,11 @@ an app linking the C library ─────────────────
 ```
 
 For MCP hosts, configure `build/chutni-mcp` as a local stdio server. It
-advertises ten tools covering capability discovery, folder status and
+advertises tools covering capability discovery, folder status and
 activation, store discovery and inspection, scanning, searching, grouped
-source context, generic
-provenance-complete artifact batches, and a compatibility helper for individual
-model artifacts. Search defaults to precise all-term matching; hosts deriving
+source context, standalone memory, generic provenance-complete artifact
+batches, and compatibility helpers for individual parser/model artifacts.
+Search defaults to precise all-term matching; hosts deriving
 queries from prose can request literal any-term matching without exposing FTS
 operator syntax.
 
@@ -199,6 +203,11 @@ producer/model/application, selector, exact source hash, and creation time.
 `chutni_source_context` returns all current interpretations together. Chutni
 validates those records and their source binding; it deliberately does not
 decide whether an interpretation is true.
+
+Knowledge or work that does not come from a file — a conversation summary,
+decision, plan, or note — goes through `chutni_put_memory`. It is searchable
+through the same `chutni_search` operation and carries the same producer and
+derivation provenance, without being represented as a fake file.
 
 ## Implementing the format directly
 

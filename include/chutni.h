@@ -271,7 +271,7 @@ typedef struct {
     char *state;
     int64_t size_bytes;
     /* Appended in ABI order after the original v0.1 fields (§12.5). */
-    char *source_kind;        /* "file" or "directory" */
+    char *source_kind;        /* "file", "directory", or "memory" */
     char *parent_source_id;   /* NULL at a root's own directory source */
     /* "enumerated" — this directory's immediate entries were observed;
      * "opaque"     — its name was observed but it was never opened (§11.1);
@@ -542,6 +542,7 @@ chutni_status chutni_forget_source(chutni_store *store, const char *source_id,
 #define CHUTNI_KIND_DIRECTORY_LISTING "directory_listing"
 #define CHUTNI_KIND_SOURCE_DEFINITION "source_definition"
 #define CHUTNI_KIND_COVERAGE_MANIFEST "coverage_manifest"
+#define CHUTNI_KIND_MEMORY "memory"
 
 /* Standard stop reasons for a definition's local coverage (§15.6). The set is
  * open; these are the ones every consumer is expected to understand. */
@@ -596,6 +597,41 @@ chutni_status chutni_artifacts_put(
     char producer_id[CHUTNI_ID_STRLEN],
     char derivation_id[CHUTNI_ID_STRLEN],
     char (*artifact_ids)[CHUTNI_ID_STRLEN]);
+
+/* A standalone piece of reusable application/model memory.
+ *
+ * Unlike an extracted_text or summary artifact, this record does not claim to
+ * describe a filesystem source. The store creates an internal source of kind
+ * "memory" solely as the stable anchor required by the common artifact,
+ * provenance, search, and forgetting machinery. `memory_kind` is deliberately
+ * open (for example: note, decision, plan, conversation_summary).
+ *
+ * `producer`, `operation`, and `text` are required. Model producers retain the
+ * same identity requirements as every other model-produced artifact. Optional
+ * input_refs_json may point at source, artifact, message, or application IDs;
+ * Chutni preserves those references and follows artifact_id dependencies for
+ * freshness as usual.
+ */
+typedef struct {
+    const char *memory_kind;
+    const char *title;
+    const char *scope;
+    const char *text;
+    const char *language;
+    const chutni_producer *producer;
+    const char *operation;
+    const char *recipe_hash;
+    const char *parameters_json;
+    const char *input_refs_json;
+} chutni_memory;
+
+chutni_status chutni_memory_put(
+    chutni_store *store,
+    const chutni_memory *memory,
+    char source_id[CHUTNI_ID_STRLEN],
+    char artifact_id[CHUTNI_ID_STRLEN],
+    char producer_id[CHUTNI_ID_STRLEN],
+    char derivation_id[CHUTNI_ID_STRLEN]);
 
 /* ----------------------------------------------------------- relationships
  *
@@ -753,7 +789,7 @@ typedef struct {
      * These fields are how it finds out: what kind of thing matched, where it
      * sits in the hierarchy, and which coverage manifest governs the region it
      * came from. */
-    char *source_kind;           /* "file" or "directory" */
+    char *source_kind;           /* "file", "directory", or "memory" */
     char *parent_source_id;      /* may be NULL */
     char *coverage_manifest_id;  /* NULL when the region has no manifest */
     int   depth;                 /* negative when unknown */

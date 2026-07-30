@@ -155,6 +155,7 @@ def main():
             "chutni_source_context",
             "chutni_put_derived_artifact",
             "chutni_put_artifacts",
+            "chutni_put_memory",
             "chutni_put_model_artifact",
         }
         assert names == expected
@@ -205,6 +206,73 @@ def main():
         assert (store / "manifest.json").is_file()
         assert (store / "catalog.sqlite").is_file()
 
+        refused, failed = session.tool(
+            "chutni_put_memory",
+            {
+                "store_path": str(store),
+                "memory_kind": "conversation_summary",
+                "text": "The team chose the saffron deployment window.",
+                "producer": {
+                    "producer_kind": "model",
+                    "name": "Test model",
+                    "model_id": "example/test-model",
+                    "model_revision": "r1",
+                    "app_name": "test-host",
+                    "app_version": "1.0",
+                },
+                "operation": "compact_conversation",
+                "confirmed": False,
+            },
+        )
+        assert failed and refused["error"] == "confirmation_required"
+
+        memory, failed = session.tool(
+            "chutni_put_memory",
+            {
+                "store_path": str(store),
+                "memory_kind": "conversation_summary",
+                "title": "Deployment choice",
+                "scope": "test-host/conversation/7",
+                "text": "The team chose the saffron deployment window.",
+                "producer": {
+                    "producer_kind": "model",
+                    "name": "Test model",
+                    "model_id": "example/test-model",
+                    "model_revision": "r1",
+                    "app_name": "test-host",
+                    "app_version": "1.0",
+                },
+                "operation": "compact_conversation",
+                "inputs": [{"message_id": "message-7"}],
+                "confirmed": True,
+            },
+        )
+        assert not failed, memory
+        assert memory["memory_id"] == memory["source_id"]
+        assert memory["artifact_id"]
+
+        memory_context, failed = session.tool(
+            "chutni_source_context",
+            {"store_path": str(store), "source_id": memory["memory_id"]},
+        )
+        assert not failed, memory_context
+        assert memory_context["source"]["freshness"] == "current"
+        assert memory_context["artifacts"][0]["metadata"]["scope"] == (
+            "test-host/conversation/7"
+        )
+        assert memory_context["artifacts"][0]["provenance"]["derivation"][
+            "inputs"
+        ] == [{"message_id": "message-7"}]
+
+        memory_search, failed = session.tool(
+            "chutni_search",
+            {"store_path": str(store), "query": "saffron deployment"},
+        )
+        assert not failed, memory_search
+        assert memory_search["count"] == 1
+        assert memory_search["results"][0]["source_kind"] == "memory"
+        assert memory_search["results"][0]["freshness"] == "current"
+
         initial_context, failed = session.tool(
             "chutni_source_context",
             {"store_path": str(store), "source_path": str(note)},
@@ -250,12 +318,13 @@ def main():
         )
         assert not failed
         assert info["counts"]["roots"] == 1
-        # The note, plus the root directory itself as a source of its own.
-        assert info["counts"]["sources"] == 2
+        # The note and root directory, plus one standalone memory. File-only
+        # readability counters remain unchanged by application memory.
+        assert info["counts"]["sources"] == 3
         assert info["counts"]["sources_files"] == 1
         assert info["counts"]["sources_directories"] == 1
         assert info["counts"]["sources_opaque_directories"] == 0
-        assert info["counts"]["artifacts_active"] == 4
+        assert info["counts"]["artifacts_active"] == 5
         assert info["counts"]["content_artifacts"] == 1
         assert info["counts"]["metadata_artifacts"] == 1
         assert info["counts"]["content_readable_sources"] == 1

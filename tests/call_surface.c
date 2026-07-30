@@ -136,12 +136,72 @@ int main(int argc, char **argv) {
         bad("create store", chutni_last_error(NULL));
         return 1;
     }
+    char *r = call(
+        s, "put_memory",
+        "{\"memory_kind\":\"decision\",\"title\":\"Launch decision\","
+        "\"scope\":\"samosa/conversation/demo\","
+        "\"text\":\"Use the jalapeño launch plan after legal review.\","
+        "\"producer\":{\"producer_kind\":\"model\",\"name\":\"Codex\","
+        "\"model_id\":\"gpt-test\",\"model_revision\":\"2026-07-30\","
+        "\"app_name\":\"samosa\",\"app_version\":\"0.1\"},"
+        "\"operation\":\"record_decision\","
+        "\"inputs\":[{\"message_id\":\"message-42\",\"required\":true}]}");
+    char *memory_id = extract_string(r, "memory_id");
+    check("put_memory stores standalone model work",
+          contains(r, "\"memory_kind\":\"decision\"") && memory_id,
+          "standalone memory");
+    free(r);
+    char *manifest = NULL;
+    chutni_manifest_json(s, &manifest);
+    check("memory use is advertised in the store manifest",
+          contains(manifest, "\"standalone_memory\""),
+          "capability gating");
+    chutni_free(manifest);
+
+    char memory_args[512];
+    snprintf(memory_args, sizeof memory_args,
+             "{\"source_id\":\"%s\"}", memory_id ? memory_id : "");
+    r = call(s, "get_source", memory_args);
+    check("standalone memory is not represented as a file",
+          contains(r, "\"source_kind\":\"memory\"") &&
+          contains(r, "\"display_path\":\"Launch decision\""),
+          "memory source kind");
+    free(r);
+
+    r = call(s, "source_context", memory_args);
+    check("memory context preserves content and provenance",
+          contains(r, "jalapeño launch plan") &&
+          contains(r, "\"model_id\":\"gpt-test\"") &&
+          contains(r, "\"message_id\":\"message-42\"") &&
+          contains(r, "\"freshness\":\"current\""),
+          "content, model identity, inputs, freshness");
+    free(r);
+
+    r = call(s, "search",
+             "{\"query\":\"jalapeño launch\",\"limit\":5}");
+    check("existing lexical search finds standalone memory",
+          contains(r, "\"source_kind\":\"memory\"") &&
+          contains(r, "\"freshness\":\"current\"") &&
+          contains(r, "\"display_path\":\"Launch decision\""),
+          "shared search path");
+    free(r);
+
+    r = call(
+        s, "put_memory",
+        "{\"memory_kind\":\"note\",\"text\":\"must not persist\","
+        "\"producer\":{\"producer_kind\":\"model\",\"name\":\"anonymous\"},"
+        "\"operation\":\"record_note\"}");
+    check("model memory requires host application identity",
+          contains(r, "\"error\"") && contains(r, "model producers require"),
+          "producer trust");
+    free(r);
+
     char root_id[CHUTNI_ID_STRLEN];
     chutni_root_add(s, tree, "tree", NULL, root_id);
 
     /* --------------------------------------------------------- store-less */
 
-    char *r = call(NULL, "capabilities", NULL);
+    r = call(NULL, "capabilities", NULL);
     check("capabilities: reports this spec version",
           contains(r, "\"spec_version\":\"" CHUTNI_SPEC_VERSION "\""), "§30");
     check("capabilities: lists v0.2 artifact kinds",
@@ -481,10 +541,20 @@ int main(int argc, char **argv) {
           contains(r, "\"forgotten\":true"), "§20, §24.3 forget_source(source_id, mode)");
     free(r);
 
+    r = call(s, "forget_source", memory_args);
+    check("standalone memory uses the ordinary forget path",
+          contains(r, "\"forgotten\":true"), "§20, §24.3");
+    free(r);
+    r = call(s, "search", "{\"query\":\"jalapeño launch\"}");
+    check("forgotten standalone memory is no longer searchable",
+          contains(r, "\"count\":0"), "shared index cleanup");
+    free(r);
+
     r = call(s, "rebuild_indexes", NULL);
     check("rebuild_indexes via chutni_call succeeds", contains(r, "\"ok\":true"),
           "§20 rebuild_indexes()");
     free(r);
+    free(memory_id);
 
     /* -------------------------------------------------- read-only refusal */
 

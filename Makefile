@@ -113,7 +113,11 @@ test: $(CLI) $(MCP) $(BUILD)/blake3_vectors $(BUILD)/conformance $(BUILD)/call_s
 	@sh tests/conformance/run.sh $(CLI)
 	@echo
 	@CHUTNI_MCP=$(MCP) python3 tests/test_mcp.py
+	@CHUTNI_MCP=$(MCP) python3 tests/test_samosa_contract.py
 	@$(MAKE) python-test
+
+test-samosa-compat: $(MCP)
+	@CHUTNI_MCP=$(MCP) python3 tests/test_samosa_contract.py
 
 python-test: $(SHLIB)
 	@CHUTNI_LIBRARY=$(abspath $(SHLIB)) PYTHONPATH=$(abspath python) python3 -m unittest discover -s python/tests -v
