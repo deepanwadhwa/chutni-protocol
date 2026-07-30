@@ -98,11 +98,12 @@ any consumer, independent of any particular store.
 
 ```
 chutni_call(NULL, "capabilities", "{}", &result)
-{"ok":true,"spec_version":"0.2","library_version":"0.2.0",
+{"ok":true,"spec_version":"0.2","library_version":"0.3.0",
  "artifact_origins":["direct","deterministic_transform","model_generated","human"],
- "core_artifact_kinds":["file_metadata","extracted_text",...,"coverage_manifest"],
+ "core_artifact_kinds":["file_metadata","extracted_text",...,"coverage_manifest",
+                        "memory"],
  "capabilities":["sources","artifacts","provenance","hierarchical_sources",
-                 "bounded_coverage","directory_definitions"],
+                 "bounded_coverage","directory_definitions","standalone_memory"],
  "definition_stop_reasons":["max_depth_reached","producer_classified_coherent",...],
  "definition_modes":["adaptive","per_source"],
  "selector_types":["pages","sheet_range","image_region","time_range","byte_range"],
@@ -373,7 +374,7 @@ chutni_call(s, "source_context", "{\"source_path\":\"/private/tmp/x/tree/parb.md
     "content_truncated":false,
     "provenance":{
       "producer":{"producer_id":"...","app_name":"call-surface",
-                  "app_version":"0.2.0","producer_kind":"parser",
+                  "app_version":"0.3.0","producer_kind":"parser",
                   "name":"chutni-reference-scanner"},
       "derivation":{"derivation_id":"...","operation":"extract_text",
                     "created_at":"...","parameters":{"strategy":"whole_file_utf8"},

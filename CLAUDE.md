@@ -33,7 +33,7 @@ make install    # PREFIX=/usr/local
 
 `make test` must be green before anything is called done. It takes ~2 seconds.
 
-**Two versions, deliberately separate.** `VERSION` (currently `0.2.0`) is this
+**Two versions, deliberately separate.** `VERSION` (currently `0.3.0`) is this
 implementation's release; `CHUTNI_SPEC_VERSION` in `include/chutni.h` (currently
 `0.2`) is the protocol a store is written in. They move independently — a bug
 fix bumps one and not the other. `VERSION` is the single source: the Makefile
@@ -93,8 +93,10 @@ Inherited from the owner's standards and they override convenience.
   that. A suite that hides its coverage holes is worse than no suite.
 - **First-party code compiles under `-Werror`.** Vendored code is compiled as
   its authors shipped it; do not patch upstream to satisfy our flags.
-- **Outward publishing waits for explicit confirmation.** The GitHub repo does
-  not exist yet. Do not create or push it without being asked.
+- **Outward publishing waits for explicit confirmation.** The repo is public at
+  `github.com/deepanwadhwa/chutni-protocol` and `main` is pushed there. That is
+  a reason for more care, not less: anything committed is one owner push away
+  from being public. Do not push, tag, or open issues/PRs without being asked.
 - Agent shells have no push credentials. Commit and stop.
 
 ## The rule the whole format exists to enforce

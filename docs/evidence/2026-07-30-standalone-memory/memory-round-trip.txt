@@ -1,0 +1,144 @@
+### 1. create a store
+
+$ chutni init $STORE --label Evidence
+Created $STORE
+  store_id 019fb45e-06f9-7599-bd21-183820103496
+Registered so other applications can discover it.
+
+### 2. a memory is refused without host confirmation (§27)
+
+$ mcp chutni_put_memory {
+ "store_path": "$STORE",
+ "memory_kind": "decision",
+ "title": "Bump VERSION to 0.3.0",
+ "scope": "chutni-protocol/release/0.3.0",
+ "text": "VERSION moves to 0.3.0 because standalone memory shipped after the v0.2.0 tag. CHUTNI_VERSION lands in producer records, so a build with the feature must not claim a release without it.",
+ "producer": {
+  "producer_kind": "model",
+  "name": "claude-opus-5",
+  "model_id": "anthropic/claude-opus-5",
+  "app_name": "claude-code",
+  "app_version": "0.3.0"
+ },
+ "operation": "record_decision",
+ "inputs": [
+  {
+   "message_id": "close-out-review"
+  }
+ ]
+}
+{
+ "ok": false,
+ "error": "confirmation_required",
+ "message": "The host must confirm that this memory should be retained."
+}
+
+### 3. retained with explicit confirmation
+
+$ mcp chutni_put_memory {
+ "store_path": "$STORE",
+ "memory_kind": "decision",
+ "title": "Bump VERSION to 0.3.0",
+ "scope": "chutni-protocol/release/0.3.0",
+ "text": "VERSION moves to 0.3.0 because standalone memory shipped after the v0.2.0 tag. CHUTNI_VERSION lands in producer records, so a build with the feature must not claim a release without it.",
+ "producer": {
+  "producer_kind": "model",
+  "name": "claude-opus-5",
+  "model_id": "anthropic/claude-opus-5",
+  "app_name": "claude-code",
+  "app_version": "0.3.0"
+ },
+ "operation": "record_decision",
+ "inputs": [
+  {
+   "message_id": "close-out-review"
+  }
+ ],
+ "confirmed": true
+}
+{
+ "ok": true,
+ "memory_id": "019fb45e-06fe-743d-8a7c-742bd7cfd79d",
+ "source_id": "019fb45e-06fe-743d-8a7c-742bd7cfd79d",
+ "artifact_id": "019fb45e-06ff-71e1-99a0-cbb836a53e5c",
+ "producer_id": "019fb45e-06ff-7ad9-97ac-f1c025158eeb",
+ "derivation_id": "019fb45e-06ff-794c-9e64-bc8afc8ebbf5",
+ "memory_kind": "decision",
+ "semantic_validation": "not_performed",
+ "store_path": "$STORE"
+}
+
+### 4. a model producer without identity is refused (§16.2)
+
+$ mcp chutni_put_memory {
+ "store_path": "$STORE",
+ "memory_kind": "decision",
+ "title": "Bump VERSION to 0.3.0",
+ "scope": "chutni-protocol/release/0.3.0",
+ "text": "VERSION moves to 0.3.0 because standalone memory shipped after the v0.2.0 tag. CHUTNI_VERSION lands in producer records, so a build with the feature must not claim a release without it.",
+ "producer": {
+  "producer_kind": "model",
+  "name": "anonymous"
+ },
+ "operation": "record_decision",
+ "inputs": [
+  {
+   "message_id": "close-out-review"
+  }
+ ],
+ "confirmed": true
+}
+{
+ "ok": false,
+ "error": "invalid argument",
+ "message": "model producers require model_id, app_name, and app_version (\u00a716.2)"
+}
+
+### 5. it is findable by content, not by filename
+
+$ mcp chutni_search {
+ "store_path": "$STORE",
+ "query": "producer records release"
+}
+{
+ "ok": true,
+ "results": [
+  {
+   "source_id": "019fb45e-06fe-743d-8a7c-742bd7cfd79d",
+   "artifact_id": "019fb45e-06ff-71e1-99a0-cbb836a53e5c",
+   "display_path": "Bump VERSION to 0.3.0",
+   "artifact_kind": "memory",
+   "snippet": "\u2026CHUTNI_VERSION lands in producer records, so a build with the feature\u2026",
+   "producer_id": "019fb45e-06ff-7ad9-97ac-f1c025158eeb",
+   "freshness": "current",
+   "score": 3e-06,
+   "score_type": "bm25_fts5_negated",
+   "source_kind": "memory",
+   "depth": null
+  }
+ ]
+}
+
+### 6. provenance survives the round trip
+
+$ chutni inspect 019fb45e-06fe-743d-8a7c-742bd7cfd79d --store $STORE
+source 019fb45e-06fe-743d-8a7c-742bd7cfd79d  (current)
+
+  memory  [model_generated, active]
+    artifact_id 019fb45e-06ff-71e1-99a0-cbb836a53e5c
+    produced by claude-opus-5 / anthropic/claude-opus-5 via record_decision
+
+### 7. freshness with no bytes on disk
+
+$ chutni verify 019fb45e-06fe-743d-8a7c-742bd7cfd79d --store $STORE
+019fb45e-06fe-743d-8a7c-742bd7cfd79d  current
+
+### 8. forgetting is explicit
+
+$ chutni forget 019fb45e-06fe-743d-8a7c-742bd7cfd79d --store $STORE --mode purge
+Forgot 019fb45e-06fe-743d-8a7c-742bd7cfd79d (purge)
+Object payloads were unlinked. This is not forensic erasure: copies may remain in backups, snapshots, or unallocated blocks.
+
+$ chutni search producer records release --store $STORE
+No matches.
+
