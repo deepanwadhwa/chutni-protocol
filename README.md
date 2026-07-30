@@ -13,7 +13,7 @@ application or model: a store written by one program can be read, searched,
 and improved by another.
 
 - **Specification:** [SPEC.md](SPEC.md) (version 0.2-draft; v0.1 stores remain readable)
-- **This implementation:** `0.2.0` — see [VERSION](VERSION). The release version
+- **This implementation:** `0.3.0` — see [VERSION](VERSION). The release version
   and the protocol version move independently; `chutni version` prints both.
 - **License:** Apache-2.0. Royalty-free to implement.
 
@@ -64,9 +64,11 @@ Honest summary of what runs today, on one machine (macOS 15 / arm64, Apple M3).
 `make test` reports the unbuilt conformance scenarios as GAP rather than
 counting them as passes. Verified only on macOS 15 / arm64 (Apple M3) — the
 only machine this has run on. See
-[docs/evidence/](docs/evidence/2026-07-30-v0.2-hierarchical-coverage/report.md)
-for what that does and does not cover, [docs/TASKS.md](docs/TASKS.md) for the
-current completion state, and
+[docs/evidence/](docs/evidence/) for what that does and does not cover —
+most recently
+[standalone memory](docs/evidence/2026-07-30-standalone-memory/report.md) and
+[hierarchical sources and bounded coverage](docs/evidence/2026-07-30-v0.2-hierarchical-coverage/report.md)
+— plus [docs/TASKS.md](docs/TASKS.md) for the current completion state, and
 [docs/SAMOSA-COMPATIBILITY.md](docs/SAMOSA-COMPATIBILITY.md) for the pinned
 application boundary.
 

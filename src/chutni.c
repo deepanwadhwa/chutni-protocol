@@ -1527,8 +1527,9 @@ static const char *media_type_for(const char *path) {
  */
 
 /* Names the reference implementation never descends into. This is a fixed
- * list, not policy_json's exclude_globs, which remains unenforced — see
- * docs/TASKS.md. A caller that needs different exclusions cannot express them
+ * list, not policy_json's exclude_globs, which remains unenforced — see the
+ * capability table in README.md. A caller that needs different exclusions
+ * cannot express them
  * yet, and pretending otherwise would put a policy field in a listing hash
  * that nothing actually consults. */
 static int excluded_entry_name(const char *name) {

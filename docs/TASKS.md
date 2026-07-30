@@ -38,6 +38,8 @@ contract is in [API-JSON.md](API-JSON.md).
 ## Known limits, not blockers for Samosa adoption
 
 - Root remapping and `.chutnipack` transfer bundles are not implemented.
+- `exclude_globs` (§11) is accepted and recorded in policy, but not enforced.
+  Exclusion is a fixed name list in the reference scanner.
 - Windows is not supported.
 - Chutni does not ship PDF/OCR/vision/spreadsheet/audio extractors.
 - Chutni accepts producer claims with provenance; it does not certify that a
