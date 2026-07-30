@@ -85,11 +85,18 @@ $(BUILD)/conformance: tests/conformance/conformance.c $(LIBCHUTNI) VERSION
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(LIBCHUTNI) -lpthread -o $@
 
-test: $(CLI) $(MCP) $(BUILD)/blake3_vectors $(BUILD)/conformance
+$(BUILD)/call_surface: tests/call_surface.c $(LIBCHUTNI) VERSION
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $< $(LIBCHUTNI) -lpthread -o $@
+
+test: $(CLI) $(MCP) $(BUILD)/blake3_vectors $(BUILD)/conformance $(BUILD)/call_surface
 	@python3 tests/run_blake3_vectors.py $(BUILD)/blake3_vectors
 	@echo
 	@rm -rf $(BUILD)/conformance-work
 	@CHUTNI_HOME=$(BUILD)/conformance-work/home $(BUILD)/conformance $(BUILD)/conformance-work
+	@echo
+	@rm -rf $(BUILD)/call-surface-work
+	@CHUTNI_HOME=$(BUILD)/call-surface-work/home HOME=$(BUILD)/call-surface-work/home $(BUILD)/call_surface $(BUILD)/call-surface-work
 	@echo
 	@sh tests/conformance/run.sh $(CLI)
 	@echo
@@ -108,12 +115,16 @@ sanitize:
 	@mkdir -p $(BUILD)/san
 	$(CC) -std=c99 -g -O1 $(SAN) $(SAN_DEFS) $(SAN_SRC) tests/conformance/conformance.c \
 	    -o $(BUILD)/san/conformance -lpthread
+	$(CC) -std=c99 -g -O1 $(SAN) $(SAN_DEFS) $(SAN_SRC) tests/call_surface.c \
+	    -o $(BUILD)/san/call_surface -lpthread
 	$(CC) -std=c99 -g -O1 $(SAN) $(SAN_DEFS) $(SAN_SRC) src/cli.c \
 	    -o $(BUILD)/san/chutni -lpthread
 	$(CC) -std=c99 -g -O1 $(SAN) $(SAN_DEFS) $(SAN_SRC) src/mcp.c \
 	    -o $(BUILD)/san/chutni-mcp -lpthread
-	@rm -rf $(BUILD)/san/work $(BUILD)/san/home
+	@rm -rf $(BUILD)/san/work $(BUILD)/san/home $(BUILD)/san/call-surface-work
 	@CHUTNI_HOME=$(BUILD)/san/home $(BUILD)/san/conformance $(BUILD)/san/work
+	@echo
+	@CHUTNI_HOME=$(BUILD)/san/call-surface-work/home HOME=$(BUILD)/san/call-surface-work/home $(BUILD)/san/call_surface $(BUILD)/san/call-surface-work
 	@echo
 	@sh tests/conformance/run.sh $(BUILD)/san/chutni
 	@echo

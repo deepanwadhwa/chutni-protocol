@@ -1,7 +1,9 @@
 # T01 — JSON-in/JSON-out tool surface in libchutni
 
 **Priority:** P0 · **Size:** M · **Depends on:** nothing · **Spec:** §20
-**Status:** proposed 2026-07-30
+**Status:** done 2026-07-30 — see
+[`docs/API-JSON.md`](../API-JSON.md) and
+[evidence](../evidence/2026-07-30-json-call-surface/report.md).
 
 ## Why
 

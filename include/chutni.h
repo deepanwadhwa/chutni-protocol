@@ -772,6 +772,42 @@ void chutni_search_result_free(chutni_search_result *results, size_t count);
 /* Rebuild everything under indexes/ from the catalog and object store (§8.4). */
 chutni_status chutni_rebuild_indexes(chutni_store *store);
 
+/* ------------------------------------------------------------- JSON surface
+ *
+ * Every §20 minimum-access operation, plus representations and semantic
+ * search, through one JSON-in/JSON-out entry point. This exists so a language
+ * binding needs exactly four foreign functions — chutni_open, chutni_call,
+ * chutni_free, chutni_close — rather than mirroring every typed struct in
+ * this header field-for-field. The typed API above remains the primary,
+ * stable ABI other C applications compile against; chutni_call is a second
+ * surface over the same implementation, not a replacement.
+ *
+ * `store` may be NULL only for the two store-less operations, "discover" and
+ * "capabilities". Every other operation requires an already-open handle: the
+ * caller decides read-only vs. read-write by how it opened the store, and a
+ * mutating operation on a read-only handle fails with CHUTNI_ERR_READONLY,
+ * exactly as the typed functions underneath it do. chutni_call does not know
+ * what "confirmed" means and enforces no permission policy of its own — that
+ * stays the host's job (§27), same as it does for chutni-mcp today.
+ *
+ * `arguments_json` must be a JSON object (or NULL/"{}" for operations that
+ * take none); unrecognized keys are ignored, which is what lets a caller pass
+ * the same object it received over its own transport without stripping
+ * fields chutni_call doesn't need. See docs/API-JSON.md for every operation
+ * name, its argument shape, and its result shape.
+ *
+ * On success, returns CHUTNI_OK and *result_json is the operation's result
+ * object. On failure — including an unrecognized operation name — returns the
+ * failing status and *result_json is instead an error envelope:
+ *
+ *   {"error": {"code": "<chutni_strerror(status)>", "message": "<detail>"}}
+ *
+ * so a caller has exactly one shape to parse whether the call succeeded or
+ * not. *result_json is always set on CHUTNI_OK and is set whenever this
+ * function can form a response at all; caller frees it with chutni_free. */
+chutni_status chutni_call(chutni_store *store, const char *operation,
+                          const char *arguments_json, char **result_json);
+
 /* Free memory returned by APIs documented as using it. */
 void chutni_free(void *ptr);
 
