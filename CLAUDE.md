@@ -67,6 +67,7 @@ Every command accepts `--json`; agents are the primary consumers.
 | `src/cj.{c,h}` | JSON document model (a DOM, not an extractor — see below) |
 | `src/cli.c` | the `chutni` command |
 | `tests/conformance/` | §31 scenarios, C API level and CLI level |
+| `docs/tickets/` | the adoption track, T01–T15; index maps tickets to TASKS.md phases |
 | `skills/` | drop-in instructions teaching an agent to use a store |
 | `third_party/` | BLAKE3 and SQLite, vendored, compiled from source, unmodified |
 

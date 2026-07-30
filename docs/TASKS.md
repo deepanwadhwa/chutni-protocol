@@ -113,6 +113,13 @@ relevant §31 scenarios as `GAP`.
 Ordered by what unblocks the most. Each phase needs a conformance test that
 fails before and passes after, plus a transcript under `evidence/`.
 
+**The adoption track lives in [tickets/](tickets/)** — fifteen detailed
+tickets (T01–T15) covering bindings, first-run value, agent integration,
+portability, and the measurement of the token-savings claim. The tickets are
+the detailed form; the index there maps each one to the phase items it absorbs
+(A4, P1–P4, W1–W3, and two open questions below). When a ticket lands, mark
+the phase item done here and link the evidence, as always.
+
 ### Phase H — hierarchical sources and bounded coverage (§11.1–§35.1)
 
 **Done 2026-07-30.** Evidence:
