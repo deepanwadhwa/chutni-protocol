@@ -908,6 +908,20 @@ static void advertise_hierarchy(chutni_store *s) {
     if (changed) manifest_save(s);
 }
 
+static void advertise_capability(chutni_store *s, const char *capability) {
+    if (!s || s->read_only || !s->manifest || !capability) return;
+    cj *caps = cj_get(s->manifest, "capabilities");
+    if (!caps || caps->type != CJ_ARR) {
+        caps = cj_arr();
+        if (!caps || !cj_set(s->manifest, "capabilities", caps)) return;
+    }
+    for (size_t i = 0; i < caps->n; i++)
+        if (caps->items[i]->type == CJ_STR && caps->items[i]->str &&
+            !strcmp(caps->items[i]->str, capability))
+            return;
+    if (cj_push(caps, cj_str(capability))) manifest_save(s);
+}
+
 static char *locator_json_for(const char *abs_path) {
     cj *o = cj_obj();
     if (!o) return NULL;
@@ -2082,10 +2096,11 @@ static int observe_source(chutni_store *s, const char *source_id,
                           char out[CHUTNI_HASH_STRLEN], const char **state) {
     sqlite3_stmt *q = NULL;
     char kind[32] = "", path[PATH_MAX] = "", observation[32] = "";
+    char stored_state[32] = "";
     if (sqlite3_prepare_v2(s->db,
             "SELECT COALESCE(source_kind,'file'),"
             " json_extract(locator_json,'$.display_path'),"
-            " COALESCE(json_extract(metadata_json,'$.observation'),'')"
+            " COALESCE(json_extract(metadata_json,'$.observation'),''), state"
             " FROM sources WHERE source_id=?1", -1, &q, NULL) != SQLITE_OK) {
         *state = "unknown";
         return 0;
@@ -2098,9 +2113,63 @@ static int observe_source(chutni_store *s, const char *source_id,
         snprintf(path, sizeof path, "%s", p ? (const char *)p : "");
         snprintf(observation, sizeof observation, "%s",
                  (const char *)sqlite3_column_text(q, 2));
+        snprintf(stored_state, sizeof stored_state, "%s",
+                 (const char *)sqlite3_column_text(q, 3));
     }
     sqlite3_finalize(q);
-    if (!found || !path[0]) { *state = "unknown"; return 0; }
+    if (!found) { *state = "unknown"; return 0; }
+
+    /* A standalone memory is born inside Chutni; there is no external file to
+       stat. Re-hash the active memory artifact itself so check_freshness still
+       detects catalog corruption instead of comparing two remembered hashes.
+       The catalog is the original data store here, not a cache of bytes living
+       somewhere else. */
+    if (!strcmp(kind, "memory")) {
+        if (strcmp(stored_state, "present")) {
+            *state = !strcmp(stored_state, "missing") ? "missing" : "unknown";
+            return 0;
+        }
+        if (sqlite3_prepare_v2(s->db,
+                "SELECT inline_text, object_hash FROM artifacts"
+                " WHERE source_id=?1 AND artifact_kind='memory'"
+                " AND status='active' ORDER BY created_at DESC LIMIT 1",
+                -1, &q, NULL) != SQLITE_OK) {
+            *state = "unknown";
+            return 0;
+        }
+        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(q) != SQLITE_ROW) {
+            sqlite3_finalize(q);
+            *state = "unknown";
+            return 0;
+        }
+        const void *inline_text = sqlite3_column_text(q, 0);
+        int inline_bytes = sqlite3_column_bytes(q, 0);
+        if (inline_text) {
+            chutni_hash_bytes(inline_text, (size_t)inline_bytes, out);
+            sqlite3_finalize(q);
+            return 1;
+        }
+        const unsigned char *stored_object = sqlite3_column_text(q, 1);
+        char object_hash[CHUTNI_HASH_STRLEN] = "";
+        if (stored_object)
+            snprintf(object_hash, sizeof object_hash, "%s",
+                     (const char *)stored_object);
+        sqlite3_finalize(q);
+        void *payload = NULL;
+        size_t payload_len = 0;
+        if (!object_hash[0] ||
+            chutni_object_get(s, object_hash, &payload, &payload_len) != CHUTNI_OK) {
+            free(payload);
+            *state = "unknown";
+            return 0;
+        }
+        chutni_hash_bytes(payload, payload_len, out);
+        free(payload);
+        return 1;
+    }
+
+    if (!path[0]) { *state = "unknown"; return 0; }
     if (access(path, R_OK) != 0) { *state = "missing"; return 0; }
 
     if (!strcmp(kind, "directory")) {
@@ -2712,6 +2781,142 @@ chutni_status chutni_artifacts_put(
         return CHUTNI_OK;
     if (status == CHUTNI_OK) status = CHUTNI_ERR_DB;
 
+    char detail[ERRBUF];
+    snprintf(detail, sizeof detail, "%s", chutni_last_error(s));
+    sql_exec(s, "ROLLBACK");
+    return fail(s, status, "%s",
+                detail[0] ? detail : chutni_strerror(status));
+}
+
+chutni_status chutni_memory_put(
+    chutni_store *s,
+    const chutni_memory *memory,
+    char source_id[CHUTNI_ID_STRLEN],
+    char artifact_id[CHUTNI_ID_STRLEN],
+    char producer_id[CHUTNI_ID_STRLEN],
+    char derivation_id[CHUTNI_ID_STRLEN]) {
+    if (!s || !memory || !source_id || !artifact_id || !producer_id ||
+        !derivation_id)
+        return CHUTNI_ERR_INVALID;
+    if (s->read_only)
+        return fail(s, CHUTNI_ERR_READONLY, "store is read-only");
+    if (!memory->memory_kind || !*memory->memory_kind ||
+        !memory->text || !*memory->text || !memory->producer ||
+        !memory->operation || !*memory->operation)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "memory_kind, text, producer, and operation are required");
+    if (memory->parameters_json &&
+        !json_text_has_type(memory->parameters_json, CJ_OBJ))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "memory parameters_json must be a JSON object");
+    if (memory->input_refs_json &&
+        !json_text_has_type(memory->input_refs_json, CJ_ARR))
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "memory input_refs_json must be a JSON array");
+
+    if (!uuid7(source_id))
+        return fail(s, CHUTNI_ERR_IO, "no entropy");
+    char content_hash[CHUTNI_HASH_STRLEN];
+    chutni_status status =
+        chutni_hash_bytes(memory->text, strlen(memory->text), content_hash);
+    if (status != CHUTNI_OK) return status;
+
+    char fallback_title[CHUTNI_ID_STRLEN + 8];
+    snprintf(fallback_title, sizeof fallback_title, "memory:%s", source_id);
+    cj *locator = cj_obj();
+    cj_set(locator, "scheme", cj_str("chutni-memory"));
+    cj_set(locator, "memory_id", cj_str(source_id));
+    cj_set(locator, "display_path",
+           cj_str(memory->title && *memory->title
+                      ? memory->title
+                      : fallback_title));
+    char *locator_json = cj_dump(locator, -1);
+    cj_free(locator);
+
+    cj *metadata = cj_obj();
+    cj_set(metadata, "memory_kind", cj_str(memory->memory_kind));
+    cj_set(metadata, "standalone", cj_bool(1));
+    if (memory->title && *memory->title)
+        cj_set(metadata, "title", cj_str(memory->title));
+    if (memory->scope && *memory->scope)
+        cj_set(metadata, "scope", cj_str(memory->scope));
+    char *metadata_json = cj_dump(metadata, -1);
+    cj_free(metadata);
+    if (!locator_json || !metadata_json) {
+        free(locator_json);
+        free(metadata_json);
+        return CHUTNI_ERR_NOMEM;
+    }
+
+    char now[32];
+    iso_now(now);
+    if (!sql_exec(s, "BEGIN IMMEDIATE")) {
+        free(locator_json);
+        free(metadata_json);
+        return CHUTNI_ERR_DB;
+    }
+
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "INSERT INTO sources(source_id,root_id,parent_source_id,source_kind,"
+            "locator_json,display_name,media_type,size_bytes,content_hash,state,"
+            "first_seen_at,last_seen_at,last_scanned_at,metadata_json)"
+            " VALUES(?1,NULL,NULL,'memory',?2,?3,'text/plain; charset=utf-8',"
+            "?4,?5,'present',?6,?6,?6,?7)", -1, &q, NULL) != SQLITE_OK) {
+        status = fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    } else {
+        sqlite3_bind_text(q, 1, source_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 2, locator_json, -1, SQLITE_TRANSIENT);
+        bind_text_or_null(q, 3, memory->title);
+        sqlite3_bind_int64(q, 4, (sqlite3_int64)strlen(memory->text));
+        sqlite3_bind_text(q, 5, content_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 6, now, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 7, metadata_json, -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(q);
+        sqlite3_finalize(q);
+        q = NULL;
+        status = rc == SQLITE_DONE
+                     ? CHUTNI_OK
+                     : fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    }
+
+    if (status == CHUTNI_OK)
+        status = chutni_producer_put(s, memory->producer, producer_id);
+    if (status == CHUTNI_OK)
+        status = chutni_derivation_put(
+            s, producer_id, memory->operation, memory->recipe_hash,
+            memory->parameters_json ? memory->parameters_json : "{}",
+            memory->input_refs_json ? memory->input_refs_json : "[]",
+            derivation_id);
+    if (status == CHUTNI_OK) {
+        const char *producer_kind = memory->producer->producer_kind;
+        const char *origin =
+            producer_kind && !strcmp(producer_kind, "model")
+                ? "model_generated"
+                : producer_kind && !strcmp(producer_kind, "human")
+                      ? "human"
+                      : "direct";
+        chutni_artifact artifact;
+        memset(&artifact, 0, sizeof artifact);
+        artifact.source_id = source_id;
+        artifact.artifact_kind = CHUTNI_KIND_MEMORY;
+        artifact.artifact_origin = origin;
+        artifact.media_type = "text/plain; charset=utf-8";
+        artifact.inline_text = memory->text;
+        artifact.language = memory->language;
+        artifact.source_content_hash = content_hash;
+        artifact.derivation_id = derivation_id;
+        artifact.metadata_json = metadata_json;
+        status = chutni_artifact_put(s, &artifact, artifact_id);
+    }
+
+    free(locator_json);
+    free(metadata_json);
+    if (status == CHUTNI_OK && sql_exec(s, "COMMIT")) {
+        advertise_capability(s, "standalone_memory");
+        return CHUTNI_OK;
+    }
+    if (status == CHUTNI_OK) status = CHUTNI_ERR_DB;
     char detail[ERRBUF];
     snprintf(detail, sizeof detail, "%s", chutni_last_error(s));
     sql_exec(s, "ROLLBACK");
@@ -3448,10 +3653,12 @@ static int str_in_list(const char *v, const char *const *list) {
  * Settling the question needs a re-hash: chutni_check_freshness or verify. */
 static const char *search_freshness(const char *status, const char *artifact_hash,
                                     const char *source_hash, const char *display_path,
-                                    int64_t size_bytes, int64_t mtime_ns) {
+                                    int64_t size_bytes, int64_t mtime_ns,
+                                    const char *source_kind) {
     if (status && strcmp(status, "active")) return "stale";
     if (!artifact_hash || !source_hash) return "unknown";
     if (strcmp(artifact_hash, source_hash)) return "stale";
+    if (source_kind && !strcmp(source_kind, "memory")) return "current";
     if (!display_path || !*display_path) return "current";
 
     struct stat st;
@@ -3565,7 +3772,7 @@ chutni_status chutni_search_semantic(chutni_store *s,
         "       a.artifact_kind, a.inline_text, a.object_hash, a.status,"
         "       a.source_content_hash, s.content_hash, s.size_bytes, s.mtime_ns,"
         "       json_extract(s.locator_json,'$.display_path'), d.producer_id,"
-        "       a.selector_json, s.media_type"
+        "       a.selector_json, s.media_type, s.source_kind"
         " FROM representations r"
         " JOIN artifacts a ON a.artifact_id=r.artifact_id"
         " JOIN sources s ON s.source_id=a.source_id"
@@ -3652,7 +3859,8 @@ chutni_status chutni_search_semantic(chutni_store *s,
             (const char *)sqlite3_column_text(q, 16),
             r->display_path,
             sqlite3_column_int64(q, 17),
-            sqlite3_column_int64(q, 18)));
+            sqlite3_column_int64(q, 18),
+            (const char *)sqlite3_column_text(q, 23)));
         fill_hierarchy_fields(s, r);
         n++;
     }
@@ -3690,7 +3898,7 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
         "       snippet(artifacts_fts, 4, '', '', '…', 12),"
         "       bm25(artifacts_fts),"
         "       a.status, a.source_content_hash, a.selector_json, s.content_hash, s.media_type,"
-        "       d.producer_id, s.size_bytes, s.mtime_ns"
+        "       d.producer_id, s.size_bytes, s.mtime_ns, s.source_kind"
         " FROM idx.artifacts_fts"
         " JOIN artifacts a ON a.artifact_id=artifacts_fts.artifact_id"
         " JOIN sources s ON s.source_id=a.source_id"
@@ -3747,7 +3955,8 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
             (const char *)sqlite3_column_text(q, 9),
             r->display_path,
             sqlite3_column_int64(q, 12),
-            sqlite3_column_int64(q, 13)));
+            sqlite3_column_int64(q, 13),
+            (const char *)sqlite3_column_text(q, 14)));
         fill_hierarchy_fields(s, r);
         n++;
     }
@@ -4013,7 +4222,7 @@ static chutni_status jcall_op_capabilities(const cj *args, cj **out) {
         "table_schema", "sheet_summary", "archive_listing", "thumbnail",
         "language_detection", "content_warning", "processing_error",
         CHUTNI_KIND_DIRECTORY_LISTING, CHUTNI_KIND_SOURCE_DEFINITION,
-        CHUTNI_KIND_COVERAGE_MANIFEST, NULL
+        CHUTNI_KIND_COVERAGE_MANIFEST, CHUTNI_KIND_MEMORY, NULL
     };
     for (const char **n = kind_names; *n; n++) cj_push(kinds, cj_str(*n));
     cj_set(result, "core_artifact_kinds", kinds);
@@ -4021,7 +4230,7 @@ static chutni_status jcall_op_capabilities(const cj *args, cj **out) {
     cj *capabilities = cj_arr();
     static const char *capability_names[] = {
         "sources", "artifacts", "provenance", "hierarchical_sources",
-        "bounded_coverage", "directory_definitions", NULL
+        "bounded_coverage", "directory_definitions", "standalone_memory", NULL
     };
     for (const char **n = capability_names; *n; n++) cj_push(capabilities, cj_str(*n));
     cj_set(result, "capabilities", capabilities);
@@ -4734,6 +4943,83 @@ static chutni_status jcall_op_put_artifacts(chutni_store *s, const cj *args, cj 
     return CHUTNI_OK;
 }
 
+static chutni_status jcall_op_put_memory(chutni_store *s, const cj *args,
+                                         cj **out) {
+    const char *memory_kind = jarg_str(args, "memory_kind");
+    const char *text = jarg_str(args, "text");
+    const char *operation = jarg_str(args, "operation");
+    cj *producer_json = cj_get(args, "producer");
+    if (!memory_kind || !*memory_kind || !text || !*text ||
+        !operation || !*operation || !producer_json ||
+        producer_json->type != CJ_OBJ)
+        return fail(s, CHUTNI_ERR_INVALID,
+                    "memory_kind, text, producer, and operation are required");
+
+    chutni_producer producer;
+    memset(&producer, 0, sizeof producer);
+    producer.producer_kind = jarg_str(producer_json, "producer_kind");
+    producer.name = jarg_str(producer_json, "name");
+    producer.version = jarg_str(producer_json, "version");
+    producer.model_id = jarg_str(producer_json, "model_id");
+    producer.model_revision = jarg_str(producer_json, "model_revision");
+    producer.weights_hash = jarg_str(producer_json, "weights_hash");
+    producer.quantization = jarg_str(producer_json, "quantization");
+    producer.runtime = jarg_str(producer_json, "runtime");
+    producer.app_name = jarg_str(producer_json, "app_name");
+    producer.app_version = jarg_str(producer_json, "app_version");
+    cj *details = cj_get(producer_json, "details");
+    char *details_json = details ? cj_dump(details, -1) : NULL;
+    producer.details_json = details_json;
+
+    cj *parameters = cj_get(args, "parameters");
+    char *parameters_json = parameters ? cj_dump(parameters, -1) : strdup("{}");
+    cj *inputs = cj_get(args, "inputs");
+    char *inputs_json = inputs ? cj_dump(inputs, -1) : strdup("[]");
+    if (!parameters_json || !inputs_json || (details && !details_json)) {
+        free(details_json);
+        free(parameters_json);
+        free(inputs_json);
+        return CHUTNI_ERR_NOMEM;
+    }
+
+    chutni_memory memory;
+    memset(&memory, 0, sizeof memory);
+    memory.memory_kind = memory_kind;
+    memory.title = jarg_str(args, "title");
+    memory.scope = jarg_str(args, "scope");
+    memory.text = text;
+    memory.language = jarg_str(args, "language");
+    memory.producer = &producer;
+    memory.operation = operation;
+    memory.recipe_hash = jarg_str(args, "recipe_hash");
+    memory.parameters_json = parameters_json;
+    memory.input_refs_json = inputs_json;
+
+    char source_id[CHUTNI_ID_STRLEN] = "";
+    char artifact_id[CHUTNI_ID_STRLEN] = "";
+    char producer_id[CHUTNI_ID_STRLEN] = "";
+    char derivation_id[CHUTNI_ID_STRLEN] = "";
+    chutni_status status =
+        chutni_memory_put(s, &memory, source_id, artifact_id, producer_id,
+                          derivation_id);
+    free(details_json);
+    free(parameters_json);
+    free(inputs_json);
+    if (status != CHUTNI_OK) return status;
+
+    cj *result = cj_obj();
+    cj_set(result, "ok", cj_bool(1));
+    cj_set(result, "memory_id", cj_str(source_id));
+    cj_set(result, "source_id", cj_str(source_id));
+    cj_set(result, "artifact_id", cj_str(artifact_id));
+    cj_set(result, "producer_id", cj_str(producer_id));
+    cj_set(result, "derivation_id", cj_str(derivation_id));
+    cj_set(result, "memory_kind", cj_str(memory_kind));
+    cj_set(result, "semantic_validation", cj_str("not_performed"));
+    *out = result;
+    return CHUTNI_OK;
+}
+
 static chutni_status jcall_op_put_representation(chutni_store *s, const cj *args, cj **out) {
     const char *artifact_id = jarg_str(args, "artifact_id");
     cj *profile_json = cj_get(args, "profile");
@@ -5055,6 +5341,8 @@ chutni_status chutni_call(chutni_store *s, const char *operation,
         status = jcall_op_add_source(s, args, &out);
     } else if (!strcmp(operation, "put_artifacts")) {
         status = jcall_op_put_artifacts(s, args, &out);
+    } else if (!strcmp(operation, "put_memory")) {
+        status = jcall_op_put_memory(s, args, &out);
     } else if (!strcmp(operation, "put_model_artifact")) {
         status = jcall_op_put_model_artifact(s, args, &out);
     } else if (!strcmp(operation, "put_representation")) {

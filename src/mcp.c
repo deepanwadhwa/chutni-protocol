@@ -1143,6 +1143,37 @@ static cj *tool_source_context(const cj *arguments, int *is_error) {
     return result;
 }
 
+static cj *tool_put_memory(const cj *arguments, int *is_error) {
+    if (!argument_bool(arguments, "confirmed", 0)) {
+        *is_error = 1;
+        return tool_error(
+            "confirmation_required",
+            "The host must confirm that this memory should be retained.");
+    }
+    const char *store_path = argument_string(arguments, "store_path");
+    const cj *producer = cj_get(arguments, "producer");
+    if (!store_path || !argument_string(arguments, "memory_kind") ||
+        !argument_string(arguments, "text") ||
+        !argument_string(arguments, "operation") || !producer ||
+        producer->type != CJ_OBJ) {
+        *is_error = 1;
+        return tool_error(
+            "invalid_arguments",
+            "store_path, memory_kind, text, producer, operation, and confirmed are required.");
+    }
+
+    chutni_store *store = NULL;
+    chutni_status status = chutni_open(store_path, 0, &store);
+    if (status != CHUTNI_OK) {
+        *is_error = 1;
+        return status_error("Cannot open store for memory write", status, NULL);
+    }
+    cj *result = jcall_dispatch(store, "put_memory", arguments, is_error);
+    if (!*is_error) cj_set(result, "store_path", cj_str(store_path));
+    chutni_close(store);
+    return result;
+}
+
 /* T01: jcall_op_put_model_artifact in src/chutni.c performs this exact
  * sequence — resolve by source_path, refresh and require "current", hash,
  * record producer/derivation/artifact, rebuild indexes — so this wrapper is
@@ -1269,6 +1300,8 @@ static cj *dispatch_tool(const char *name, const cj *arguments, int *is_error) {
         result = tool_put_derived_artifact(arguments, is_error);
     else if (name && !strcmp(name, "chutni_put_artifacts"))
         result = tool_put_artifacts(arguments, is_error);
+    else if (name && !strcmp(name, "chutni_put_memory"))
+        result = tool_put_memory(arguments, is_error);
     else if (name && !strcmp(name, "chutni_put_model_artifact"))
         result = tool_put_model_artifact(arguments, is_error);
     else {
@@ -1650,6 +1683,64 @@ static cj *tools_list(void) {
         cj_push(tools, tool_definition(
             "chutni_put_artifacts", "Store processed artifacts",
             "Atomically store one or more host-produced artifacts with exact source-version binding and complete processing provenance. Chutni validates structure and integrity only; it never verifies whether OCR, captions, summaries, or other claims are semantically true.",
+            input_schema(properties, required), 0, 0, 0));
+    }
+    {
+        cj *properties = cj_obj();
+        cj_set(properties, "store_path",
+               schema_string("Absolute path to a .chutni store."));
+        cj_set(properties, "memory_kind",
+               schema_string("Open memory type such as note, decision, plan, or conversation_summary."));
+        cj_set(properties, "title",
+               schema_string("Optional human-readable title."));
+        cj_set(properties, "scope",
+               schema_string("Optional application, workspace, conversation, or project scope."));
+        cj_set(properties, "text",
+               schema_string("The reusable knowledge or work product to retain."));
+        cj_set(properties, "language",
+               schema_string("Optional BCP 47 language tag."));
+
+        cj *producer_properties = cj_obj();
+        cj_set(producer_properties, "producer_kind",
+               schema_string("parser, model, application, human, pipeline, or unknown."));
+        cj_set(producer_properties, "name",
+               schema_string("Human-readable producer identity."));
+        cj_set(producer_properties, "version", schema_string("Producer version."));
+        cj_set(producer_properties, "model_id", schema_string("Exact model identifier."));
+        cj_set(producer_properties, "model_revision", schema_string("Model revision."));
+        cj_set(producer_properties, "weights_hash", schema_string("Model weights hash."));
+        cj_set(producer_properties, "quantization", schema_string("Model quantization."));
+        cj_set(producer_properties, "runtime", schema_string("Runtime used."));
+        cj_set(producer_properties, "app_name", schema_string("Host application name."));
+        cj_set(producer_properties, "app_version", schema_string("Host application version."));
+        cj *producer_details = cj_obj();
+        cj_set(producer_details, "type", cj_str("object"));
+        cj_set(producer_properties, "details", producer_details);
+        const char *producer_required[] = {
+            "producer_kind", "name", NULL
+        };
+        cj_set(properties, "producer",
+               input_schema(producer_properties, producer_required));
+
+        cj_set(properties, "operation",
+               schema_string("How the memory was produced, such as compact_conversation or record_decision."));
+        cj_set(properties, "recipe_hash",
+               schema_string("Optional prompt, recipe, or procedure identifier."));
+        cj *parameters = cj_obj();
+        cj_set(parameters, "type", cj_str("object"));
+        cj_set(properties, "parameters", parameters);
+        cj *inputs = cj_obj();
+        cj_set(inputs, "type", cj_str("array"));
+        cj_set(properties, "inputs", inputs);
+        cj_set(properties, "confirmed",
+               schema_boolean("Must be true when the host intends to retain this memory."));
+        const char *required[] = {
+            "store_path", "memory_kind", "text", "producer", "operation",
+            "confirmed", NULL
+        };
+        cj_push(tools, tool_definition(
+            "chutni_put_memory", "Store standalone memory",
+            "Retain a note, decision, plan, conversation summary, or other reusable work product with producer identity and provenance, without claiming it came from a file.",
             input_schema(properties, required), 0, 0, 0));
     }
     {

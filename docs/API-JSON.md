@@ -487,6 +487,52 @@ source's current bytes is refused (§13.3), same as the typed API:
  "message":"each artifact requires source_id, source_content_hash, text, artifact_kind, and artifact_origin"}}
 ```
 
+### `put_memory`
+
+Store reusable knowledge or work that was not derived from a file. This wraps
+`chutni_memory_put` and creates one catalog-native source with
+`source_kind: "memory"`, one `memory` artifact, and complete producer and
+derivation records. The returned `memory_id` is the source ID, so existing
+`search`, `source_context`, `check_freshness`, and `forget_source` operations
+work without a parallel memory subsystem.
+
+| Argument | Type | Notes |
+|---|---|---|
+| `memory_kind` | string, required | open type such as `note`, `decision`, `plan`, or `conversation_summary` |
+| `title` | string | optional display title |
+| `scope` | string | optional application, workspace, project, or conversation scope |
+| `text` | string, required | non-empty reusable content |
+| `language` | string | optional BCP 47 tag |
+| `producer` | object, required | matches `chutni_producer`; model producers require `model_id`, `app_name`, and `app_version` |
+| `operation` | string, required | how the memory was made |
+| `recipe_hash` | string | optional |
+| `parameters` | object | optional, defaults to `{}` |
+| `inputs` | array | optional references to sources, artifacts, messages, or application records |
+
+```c
+chutni_call(s, "put_memory",
+  "{\"memory_kind\":\"decision\",\"title\":\"Launch decision\","
+  "\"scope\":\"my-app/conversation/42\","
+  "\"text\":\"Ship after legal review.\","
+  "\"producer\":{\"producer_kind\":\"model\",\"name\":\"my-model\","
+  "\"model_id\":\"example/x\",\"app_name\":\"my-app\",\"app_version\":\"1\"},"
+  "\"operation\":\"record_decision\","
+  "\"inputs\":[{\"message_id\":\"message-42\"}]}",
+  &result)
+```
+
+```json
+{"ok":true,"memory_id":"019fb3b1-...","source_id":"019fb3b1-...",
+ "artifact_id":"019fb3b1-...","producer_id":"019fb3b1-...",
+ "derivation_id":"019fb3b1-...","memory_kind":"decision",
+ "semantic_validation":"not_performed"}
+```
+
+Standalone memory has no external bytes to re-observe. Freshness re-hashes its
+active memory artifact, so the content hash binds the source and artifact to
+the text committed in the same transaction. It remains `"current"` until
+explicitly forgotten or until a required artifact input becomes stale.
+
 ### `put_model_artifact`
 
 Convenience wrapper for one model-generated artifact against one source

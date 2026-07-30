@@ -81,5 +81,7 @@ class Store:
     def inspect(self, source): return self.call("source_context", source_path=os.fspath(source))
     def verify(self, source=None): return self.call("check_freshness", **({"source_path": os.fspath(source)} if source else {}))
     def put_artifacts(self, producer, operation, artifacts, input_refs=None, **kw): return self.call("put_artifacts", producer=producer, operation=operation, artifacts=artifacts, inputs=input_refs or [], **kw)
+    def put_memory(self, memory_kind, text, producer, operation, inputs=None, **kw): return self.call("put_memory", memory_kind=memory_kind, text=text, producer=producer, operation=operation, inputs=inputs or [], **kw)
+    def memory(self, memory_id): return self.call("source_context", source_id=memory_id)
     def put_representation(self, artifact_id, profile, vector): return self.call("put_representation", artifact_id=artifact_id, profile=profile, vector=vector)
     def forget(self, source, mode="catalog_only"): return self.call("forget_source", source_path=os.fspath(source), mode=mode)

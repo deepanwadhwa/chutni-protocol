@@ -2,11 +2,13 @@
 
 **Version:** 0.2-draft
 **Status:** Proposed; v0.1 stores remain readable
-**Scope:** Portable, source-backed memory artifacts for local files and AI applications
+**Scope:** Portable, provenance-bearing memory for local files and AI applications
 
 **What v0.2 adds.** Directories become sources in their own right, scans become
 depth-bounded and say how far they reached, and definitions must record how
-much they actually looked at. The additions are capability-gated (§38): a v0.1
+much they actually looked at. Applications may also store standalone knowledge
+and work products without representing them as files. The additions are
+capability-gated (§38): a v0.1
 store stays valid and readable, and its silence about depth means the unbounded
 recursion it performed, never depth zero.
 
@@ -20,20 +22,28 @@ recursion it performed, never depth zero.
 | Hierarchy predicates | §18 |
 | Coverage fields on search results | §19.3 |
 | `observe_directory`, `list_children`, `get_coverage`, `scan` | §20 |
+| Standalone application/model memory | §12.6, §15.2, §20 |
 | Bounded reconciliation of absent sources | §24.4 |
 | Compatibility rules | §38 |
 
 ## 1. Abstract
 
-Chutni is an open protocol for creating, storing, exchanging, updating, and querying AI-readable memory derived from a user’s local files.
+Chutni is an open protocol for creating, storing, exchanging, updating, and
+querying AI-readable memory. That memory may be derived from a user's local
+files or recorded directly by an application, model, pipeline, or person.
 
-A Chutni store is a persistent semantic map of files. It records where files exist, what they contain, how derived descriptions were produced, and whether those descriptions are still valid for the current file contents. The store may include extracted text, OCR, captions, summaries, chunks, metadata, embeddings, and disposable search indexes.
+A Chutni store is a persistent semantic map of files and reusable work. It
+records where files exist, what they contain, how descriptions or standalone
+memories were produced, and whether they are still valid. The store may include
+extracted text, OCR, captions, summaries, chunks, decisions, plans, notes,
+metadata, embeddings, and disposable search indexes.
 
 Chutni is not tied to Samosa, a particular operating system, a particular language model, or local inference. Any compatible application may create a Chutni store, read one created by another application, improve selected artifacts with a different model, or expose the store to a local or cloud model through a permission-controlled gateway.
 
 The core design principle is:
 
-> Prepare a user’s files for AI once, preserve the result as a user-owned artifact, and allow compatible applications to reuse or improve it without rebuilding everything.
+> Preserve useful knowledge and work as user-owned artifacts, with enough
+> provenance for compatible applications to reuse or improve it safely.
 
 ## 2. Normative language
 
@@ -65,7 +75,7 @@ Chutni v0.1 does not attempt to:
 5. Standardize operating-system file-watching APIs.
 6. Require one vector database, embedding model, parser, or runtime.
 7. Store a complete copy of every source file.
-8. Define conversational memory, personality memory, or agent identity.
+8. Standardize complete conversation state, personality, or agent identity.
 9. Execute instructions found inside indexed files.
 10. Require cloud connectivity.
 
@@ -75,7 +85,10 @@ A Chutni ecosystem contains the following roles.
 
 ### 5.1 Source
 
-A source is an original item from which memory is derived. In v0.1, the primary source type is a local file. Sources may also represent directories, archive members, removable-drive files, or other locally addressable objects.
+A source is the stable anchor for one or more artifacts. In v0.1, the primary
+source type is a local file. Sources may also represent directories, archive
+members, removable-drive files, other locally addressable objects, or a
+catalog-native standalone memory (§12.6).
 
 ### 5.2 Producer
 
@@ -267,14 +280,15 @@ A v0.1 manifest MUST be UTF-8 JSON and MUST contain:
 Unknown manifest fields MUST be preserved by applications that rewrite the manifest, unless the user explicitly requests cleanup.
 
 `capabilities` names the optional behavior a store's writers have used. v0.2
-reserves three:
+reserves four:
 
 ```json
 {
   "spec_version": "0.2",
   "capabilities": [
     "sources", "artifacts", "provenance",
-    "hierarchical_sources", "bounded_coverage", "directory_definitions"
+    "hierarchical_sources", "bounded_coverage", "directory_definitions",
+    "standalone_memory"
   ]
 }
 ```
@@ -285,6 +299,8 @@ reserves three:
   manifests (§11.1, §15.7).
 * `directory_definitions` — directory `source_definition` artifacts carrying
   local coverage may be present (§15.6).
+* `standalone_memory` — catalog-native `memory` sources and artifacts may be
+  present (§12.6).
 
 A writer that records hierarchical coverage MUST advertise the corresponding
 capability, and SHOULD add it at the point it first uses the feature rather
@@ -578,10 +594,11 @@ A producer SHOULD distinguish `missing` from `deleted` when the operating system
 ### 12.5 Directory sources
 
 A directory is a source in its own right, not a path prefix on a file's
-locator. `source_kind` MUST be one of:
+locator. v0.2 reserves these `source_kind` values:
 
 * `file`
 * `directory`
+* `memory`
 
 Requirements:
 
@@ -616,6 +633,29 @@ record a content-derived artifact against an opaque directory: there is no
 observation for it to describe. A producer that wants to describe an unopened
 directory observes it first (§20), which is one directory and no recursion.
 
+### 12.6 Standalone memory sources
+
+A `memory` source anchors reusable knowledge or work that does not claim to be
+derived from a filesystem item: for example a note, decision, plan,
+conversation summary, analysis, or work product.
+
+Requirements:
+
+* `root_id` and `parent_source_id` MUST be null.
+* `locator_json.scheme` MUST be `chutni-memory`.
+* `locator_json.memory_id` MUST identify the memory within the store. Using the
+  source ID is RECOMMENDED.
+* `content_hash` MUST be BLAKE3 over the exact committed memory text.
+* `metadata_json.memory_kind` MUST state the open application-level kind.
+* The source MUST carry a `memory` artifact with producer and derivation
+  provenance.
+
+A memory source is catalog-native: there is no external file to re-observe.
+Verification re-hashes the active memory artifact's text and compares it with
+the source and artifact hashes. It remains current until explicitly forgotten
+or until required derivation inputs become stale. Consumers MUST NOT interpret
+its display path as a filesystem path.
+
 ## 13. Hashing and freshness
 
 ### 13.1 Content hash
@@ -645,7 +685,9 @@ AND every required input in its derivation is still current
 ```
 
 For a file, "the source observation" is the hash of its bytes. For a directory,
-it is the hash of the observed listing (§13.5).
+it is the hash of the observed listing (§13.5). For catalog-native standalone
+memory, it is the committed text hash (§12.6); no filesystem observation
+exists.
 
 The second clause is new in v0.2, and it is what makes a derived description
 honest. A directory definition written from three child summaries is a claim
@@ -664,12 +706,17 @@ derivation's `input_refs_json`:
 An entry with no `required` field is required. An artifact becomes stale when
 any required input becomes stale.
 
-Verifying an artifact MUST re-derive the source observation from the
-filesystem. Comparing `artifact.source_content_hash` against
+Verifying a file- or directory-backed artifact MUST re-derive the source
+observation from the filesystem. Comparing `artifact.source_content_hash` against
 `source.content_hash` alone is insufficient: both are catalog state, so when a
 file changes and nothing has rescanned it, the two agree with each other while
 the disk says otherwise, and the artifact reports itself current while
 describing content that is gone.
+
+For a standalone memory source, the catalog is the original data store rather
+than a cache of external bytes. Verification MUST hash the active memory
+artifact's text, compare it with the memory source and artifact hashes, and
+honor artifact status and required derivation inputs.
 
 If a source observation changes, prior artifacts MUST be marked `stale` or
 superseded. They MUST NOT remain silently `active`. Implementations MUST
@@ -786,11 +833,12 @@ Chutni v0.1 reserves the following artifact kinds:
 * `content_warning`;
 * `processing_error`.
 
-v0.2 reserves three more, specified in §15.5–§15.7:
+v0.2 reserves four more, specified in §12.6 and §15.5–§15.7:
 
 * `directory_listing`;
 * `source_definition`;
 * `coverage_manifest`.
+* `memory`.
 
 Applications MAY use namespaced artifact kinds, such as:
 
@@ -1279,6 +1327,7 @@ list_artifacts(source_id)
 source_context(source_id)
 add_or_update_source(locator)
 put_artifacts(producer, derivation, artifacts[])
+put_memory(memory_kind, text, producer, derivation, inputs[])
 mark_source_missing(source_id)
 forget_source(source_id, mode)
 rebuild_indexes()
@@ -1654,15 +1703,19 @@ The Chutni project SHOULD publish a test suite containing:
 13. An application-handoff scenario in which one host creates memory for a
     selected directory, a second host reads and updates it, and the first host
     can read the update without migration.
+14. A standalone-memory scenario in which one application records a decision
+    with model/application identity and message inputs, and another application
+    finds it through ordinary search and reads its provenance without a file
+    root.
 
 An implementation advertising `hierarchical_sources` or `bounded_coverage`
 (§9.1) SHOULD additionally publish results for:
 
-14. **Depth zero** enumerates only the selected root.
-15. **Depth one** enumerates immediate child directories but no grandchildren.
-16. Directory sources have correct parents.
-17. Collapsed directories remain explicitly opaque.
-18. Every directory definition reports local coverage and a stop reason.
+15. **Depth zero** enumerates only the selected root.
+16. **Depth one** enumerates immediate child directories but no grandchildren.
+17. Directory sources have correct parents.
+18. Collapsed directories remain explicitly opaque.
+19. Every directory definition reports local coverage and a stop reason.
 19. A coverage manifest contains both the requested and the achieved depth.
 20. A shallow refresh does not mark deeper sources missing.
 21. A changed directory listing stales dependent definitions.
@@ -1885,11 +1938,14 @@ The following are intentionally not finalized in v0.1:
 7. Conflict resolution for simultaneous writers.
 8. Standardized access-control lists inside the store.
 9. Portable filesystem snapshots or source bundling.
-10. Conversation and agent-memory interoperability.
+10. Rich conversation synchronization and agent-identity interoperability
+    beyond standalone provenance-bearing records.
 
 ## 38. One-sentence definition
 
-> **Chutni is an open, source-backed, model-transparent memory protocol that lets AI applications prepare a user’s local files once and reuse that memory across models, applications, and operating systems.**
+> **Chutni is an open, model-transparent memory protocol that lets AI
+> applications preserve file-derived knowledge and standalone work once, then
+> reuse it across models, applications, and operating systems.**
 
 ## 39. Store discovery
 
