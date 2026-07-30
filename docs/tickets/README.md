@@ -40,7 +40,7 @@ and move to the next unblocked ticket.
 | T03 | not started | — |
 | T04 | not started | — |
 | T05 | not started | — |
-| T06 | not started | — |
+| T06 | in progress | ticket/T06-implementers-quickstart |
 | T07 | not started | — |
 | T08 | not started | — |
 | T09 | not started | — |
