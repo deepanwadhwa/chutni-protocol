@@ -1,7 +1,7 @@
 # T05 — Agent beachhead: Claude Code and MCP clients
 
 **Priority:** P0 · **Size:** M · **Depends on:** nothing (T04 improves it) · **Spec:** §40, skills/
-**Status:** proposed 2026-07-30
+**Status:** done 2026-07-30 — [Codex evidence](../evidence/2026-07-30-codex-agent-integration/report.md).
 
 ## Why
 
