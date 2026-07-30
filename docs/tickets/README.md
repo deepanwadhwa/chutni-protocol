@@ -1,5 +1,58 @@
 # Adoption track — tickets
 
+## Workflow — read this before picking up a ticket
+
+**One task at a time.** Pick the highest-priority open ticket whose
+dependencies are already merged (see the dependency graph below). Before
+starting, check this table for `in progress` rows — if the ticket you want is
+already claimed, pick a different one rather than duplicating work.
+
+1. `git checkout main && git pull` (or confirm `main` is current if working
+   offline), then `git checkout -b ticket/T<NN>-<slug>`.
+2. Mark the row `in progress` in the status table below, in its own commit on
+   the branch, so a second agent starting concurrently sees it.
+3. Do the ticket's work. `make test` (and `make sanitize` for anything
+   touching `src/`) must be green before it is considered finished. Evidence
+   transcripts go under `docs/evidence/` per the ticket's "Evidence required"
+   section — do not mark a ticket done without them if it calls for one.
+4. Update `docs/TASKS.md` if the ticket closes a phase item or open question
+   (the ticket's own text says which).
+5. Merge the branch into `main` (`git merge --no-ff` is fine; this repo has no
+   PR review step configured, so a direct merge after a green suite is the
+   process). Update this table's row to `done`, with the commit that finished
+   it. Delete the branch.
+6. Do not push to `origin` as part of this loop. This repo's rule is that
+   outward publishing waits for explicit confirmation (see T15) — commit and
+   merge locally, and stop there unless separately asked to push.
+7. Repeat: return to step 1 for the next ticket.
+
+If a ticket turns out to be blocked (needs owner input, needs a live agent
+session, needs infrastructure this environment doesn't have), say so in the
+status table (`blocked` + one-line reason) rather than forcing a partial merge,
+and move to the next unblocked ticket.
+
+### Status
+
+| ID | Status | Branch / commit |
+|---|---|---|
+| T01 | not started | — |
+| T02 | not started | — |
+| T03 | not started | — |
+| T04 | not started | — |
+| T05 | not started | — |
+| T06 | not started | — |
+| T07 | not started | — |
+| T08 | not started | — |
+| T09 | not started | — |
+| T10 | not started | — |
+| T11 | not started | — |
+| T12 | not started | — |
+| T13 | not started | — |
+| T14 | not started | — |
+| T15 | not started | owner-gated, see ticket |
+
+## Overview
+
 **Goal (owner, 2026-07-30):** Chutni should be as useful as possible and
 extremely easy to adopt. A user plugs Chutni into the LLM application of their
 choice and stops paying for the same extraction, reading, and indexing work
