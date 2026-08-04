@@ -44,9 +44,11 @@ UNAME_S   := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 SHLIB     := $(BUILD)/libchutni.dylib
 SHLIBFLAG := -dynamiclib
+LDLIBS    :=
 else
 SHLIB     := $(BUILD)/libchutni.so
 SHLIBFLAG := -shared
+LDLIBS    := -lm
 endif
 
 .PHONY: all clean test install conformance sanitize python-test
@@ -58,13 +60,13 @@ $(LIBCHUTNI): $(LIB_OBJ) $(B3_OBJ) $(SQL_OBJ)
 
 $(SHLIB): $(LIB_SRC) $(B3_SRC) third_party/sqlite/sqlite3.c VERSION
 	$(CC) -std=c99 $(OPT) $(VERDEF) -Iinclude -Isrc -Ithird_party/blake3 -Ithird_party/sqlite -fPIC $(SHLIBFLAG) $(B3FLAGS) $(SQLFLAGS) -o $@ \
-	    $(LIB_SRC) $(B3_SRC) third_party/sqlite/sqlite3.c -lpthread
+	    $(LIB_SRC) $(B3_SRC) third_party/sqlite/sqlite3.c $(LDLIBS) -lpthread
 
 $(CLI): $(BUILD)/src/cli.o $(LIBCHUTNI)
-	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) -lpthread
+	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) $(LDLIBS) -lpthread
 
 $(MCP): $(BUILD)/src/mcp.o $(LIBCHUTNI)
-	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) -lpthread
+	$(CC) $(CFLAGS) -o $@ $< $(LIBCHUTNI) $(LDLIBS) -lpthread
 
 # First-party code is held to -Werror. VERSION is a prerequisite because the
 # release string is compiled in: without it, editing VERSION leaves stale
