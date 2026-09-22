@@ -395,6 +395,11 @@ typedef struct {
      * cannot alter policy or cancel the scan. Appended for ABI stability. */
     chutni_scan_progress_callback progress_callback;
     void *progress_userdata;
+    /* Optional per-run traversal budgets. Zero leaves the corresponding
+     * budget unbounded; Samosa sets these from the accepted folder preview. */
+    uint64_t max_files;
+    uint64_t max_directories;
+    uint32_t max_seconds;
 } chutni_scan_options;
 
 typedef struct chutni_scan_result {
@@ -420,6 +425,8 @@ typedef struct chutni_scan_result {
     uint64_t sources_marked_missing;   /* only within the covered region (§24.4) */
     int      deepest_directory_enumerated;
     int      complete_for_policy;
+    int      partial;
+    const char *limiting_reason; /* static string, valid with this result */
 } chutni_scan_result;
 
 /* Scan every root recorded in the store, then rebuild disposable indexes.

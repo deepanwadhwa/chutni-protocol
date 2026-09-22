@@ -25,6 +25,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* The implementation's release version comes from the VERSION file via the
  * Makefile. The fallback keeps a hand-rolled compile working without it, and says
@@ -51,7 +52,28 @@ typedef struct {
     uint64_t max_bytes;
     chutni_scan_progress_callback progress_callback;
     void *progress_userdata;
+    uint64_t max_files;
+    uint64_t max_directories;
+    uint64_t started_ms;
+    uint32_t max_seconds;
+    int stopped;
 } scan_context;
+
+static uint64_t scan_monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int scan_budget_expired(scan_context *sc) {
+    uint64_t now = scan_monotonic_ms();
+    if (!sc->max_seconds || !now || now - sc->started_ms < (uint64_t)sc->max_seconds * 1000u)
+        return 0;
+    sc->result->partial = 1;
+    sc->result->limiting_reason = "deadline";
+    sc->stopped = 1;
+    return 1;
+}
 
 static int looks_texty(const char *path) {
     const char *ext = strrchr(path, '.');
@@ -85,6 +107,19 @@ static int effective_max_depth(const char *policy_json,
         if (v && v->type == CJ_BOOL) policy_out->include_hidden = v->bval;
         v = cj_get(policy, "max_depth");
         if (v && v->type == CJ_NUM) depth = (int)v->num;
+        v = cj_get(policy, "exclude_globs");
+        if (v && v->type == CJ_ARR && v->n) {
+            const char **globs = calloc(v->n + 1, sizeof(*globs));
+            if (globs) {
+                size_t used = 0;
+                for (size_t i = 0; i < v->n; i++) {
+                    if (v->items[i] && v->items[i]->type == CJ_STR &&
+                        v->items[i]->str && *v->items[i]->str)
+                        globs[used++] = strdup(v->items[i]->str);
+                }
+                policy_out->exclude_globs = globs;
+            }
+        }
     }
     cj_free(policy);
     if (!policy_out->recursive) depth = 0;
@@ -107,6 +142,14 @@ static const char *basename_of(const char *path) {
 static void scan_file(scan_context *sc, const char *path, int depth,
                       int64_t size_bytes, char source_id[CHUTNI_ID_STRLEN]) {
     source_id[0] = 0;
+    if (sc->stopped || scan_budget_expired(sc)) return;
+    if (sc->max_files && sc->result->files_seen >= sc->max_files) {
+        sc->result->partial = 1;
+        sc->result->limiting_reason = "maximum_files";
+        sc->stopped = 1;
+        sc->result->skipped++;
+        return;
+    }
     sc->result->files_seen++;
 
     if ((uint64_t)size_bytes > sc->max_bytes) {
@@ -350,6 +393,26 @@ static void handle_child_directory(scan_context *sc, const char *path,
                                    int may_expand,
                                    char child_id[CHUTNI_ID_STRLEN]) {
     child_id[0] = 0;
+    if (sc->stopped || scan_budget_expired(sc)) {
+        sc->result->directories_observed++;
+        sc->result->depth_limited_directories++;
+        if (chutni_directory_put(sc->store, sc->root_id, path, parent_source_id,
+                                 NULL, depth, child_id) == CHUTNI_OK)
+            chutni_source_set_state(sc->store, child_id, CHUTNI_SOURCE_EXCLUDED);
+        return;
+    }
+    if (sc->max_directories &&
+        sc->result->directories_enumerated >= sc->max_directories) {
+        sc->result->partial = 1;
+        sc->result->limiting_reason = "maximum_directories";
+        sc->stopped = 1;
+        sc->result->directories_observed++;
+        sc->result->depth_limited_directories++;
+        if (chutni_directory_put(sc->store, sc->root_id, path, parent_source_id,
+                                 NULL, depth, child_id) == CHUTNI_OK)
+            chutni_source_set_state(sc->store, child_id, CHUTNI_SOURCE_EXCLUDED);
+        return;
+    }
     int within_depth = sc->max_depth == CHUTNI_DEPTH_UNBOUNDED ||
                        depth <= sc->max_depth;
     if (may_expand && within_depth && depth < MAX_WALK_DEPTH) {
@@ -367,6 +430,15 @@ static void observe(scan_context *sc, const char *dir_path,
                     const char *parent_source_id, int depth, int may_expand,
                     char dir_source_id[CHUTNI_ID_STRLEN]) {
     dir_source_id[0] = 0;
+
+    if (sc->stopped || scan_budget_expired(sc)) {
+        sc->result->directories_observed++;
+        sc->result->depth_limited_directories++;
+        if (chutni_directory_put(sc->store, sc->root_id, dir_path, parent_source_id,
+                                 NULL, depth, dir_source_id) == CHUTNI_OK)
+            chutni_source_set_state(sc->store, dir_source_id, CHUTNI_SOURCE_EXCLUDED);
+        return;
+    }
 
     chutni_dir_entry *entries = NULL;
     size_t count = 0;
@@ -406,6 +478,7 @@ static void observe(scan_context *sc, const char *dir_path,
     }
 
     for (size_t i = 0; i < count; i++) {
+        if (sc->stopped || scan_budget_expired(sc)) break;
         char full[PATH_MAX];
         if ((size_t)snprintf(full, sizeof full, "%s/%s", dir_path,
                              entries[i].name) >= sizeof full) {
@@ -517,7 +590,7 @@ static void write_coverage_manifest(scan_context *sc, const char *root_source_id
     /* "Complete for policy" means the bounded operation the policy asked for
        ran to completion. It does not mean the subtree was read, and §15.7
        requires consumers to be told the difference. */
-    sc->result->complete_for_policy = sc->result->errors == 0;
+    sc->result->complete_for_policy = sc->result->errors == 0 && !sc->result->partial;
 
     cj *payload = cj_obj();
     cj_set(payload, "scan_generation", cj_str(scan_generation));
@@ -571,6 +644,9 @@ static void write_coverage_manifest(scan_context *sc, const char *root_source_id
     cj_set(coverage, "sources_marked_missing",
            cj_num((double)sc->result->sources_marked_missing));
     cj_set(coverage, "errors", cj_num((double)sc->result->errors));
+    cj_set(coverage, "partial", cj_bool(sc->result->partial));
+    if (sc->result->limiting_reason)
+        cj_set(coverage, "limiting_reason", cj_str(sc->result->limiting_reason));
     cj_set(payload, "coverage", coverage);
     cj_set(payload, "complete_for_policy",
            cj_bool(sc->result->complete_for_policy));
@@ -688,6 +764,10 @@ static chutni_status scan_one_root(chutni_store *store, const chutni_root_info *
                        : DEFAULT_MAX_FILE_BYTES;
     sc.progress_callback = options ? options->progress_callback : NULL;
     sc.progress_userdata = options ? options->progress_userdata : NULL;
+    sc.max_files = options ? options->max_files : 0;
+    sc.max_directories = options ? options->max_directories : 0;
+    sc.max_seconds = options ? options->max_seconds : 0;
+    sc.started_ms = scan_monotonic_ms();
     sc.max_depth = effective_max_depth(root->policy_json, options, &sc.policy);
     result->deepest_directory_enumerated = 0;
 
@@ -696,14 +776,33 @@ static chutni_status scan_one_root(chutni_store *store, const chutni_root_info *
 
     char root_source_id[CHUTNI_ID_STRLEN];
     observe(&sc, root->path, NULL, 0, 1, root_source_id);
-    if (!root_source_id[0]) return CHUTNI_ERR_IO;
+    if (!root_source_id[0]) {
+        if (sc.policy.exclude_globs) {
+            const char *const *globs = sc.policy.exclude_globs;
+            for (size_t i = 0; globs[i]; i++) free((void *)globs[i]);
+            free((void *)globs);
+        }
+        return CHUTNI_ERR_IO;
+    }
 
     /* One manifest per committed scan, whether or not anything changed:
        "we looked again and it was the same" is a different fact from "nobody
        has looked", and only the manifest can tell them apart. */
     char scan_generation[CHUTNI_ID_STRLEN];
-    if (chutni_new_id(scan_generation) != CHUTNI_OK) return CHUTNI_ERR_IO;
+    if (chutni_new_id(scan_generation) != CHUTNI_OK) {
+        if (sc.policy.exclude_globs) {
+            const char *const *globs = sc.policy.exclude_globs;
+            for (size_t i = 0; globs[i]; i++) free((void *)globs[i]);
+            free((void *)globs);
+        }
+        return CHUTNI_ERR_IO;
+    }
     write_coverage_manifest(&sc, root_source_id, root->path, scan_generation);
+    if (sc.policy.exclude_globs) {
+        const char *const *globs = sc.policy.exclude_globs;
+        for (size_t i = 0; globs[i]; i++) free((void *)globs[i]);
+        free((void *)globs);
+    }
     return CHUTNI_OK;
 }
 
@@ -750,7 +849,7 @@ chutni_status chutni_scan(chutni_store *store,
             deepest = result->deepest_directory_enumerated;
     }
     result->deepest_directory_enumerated = deepest;
-    result->complete_for_policy = result->errors == 0;
+    result->complete_for_policy = result->errors == 0 && !result->partial;
     chutni_root_info_free(roots, root_count);
     return chutni_rebuild_indexes(store);
 }

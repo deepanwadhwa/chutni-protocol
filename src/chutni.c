@@ -12,12 +12,14 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -1526,20 +1528,35 @@ static const char *media_type_for(const char *path) {
  * table grew would stale every directory in every store on upgrade.
  */
 
-/* Names the reference implementation never descends into. This is a fixed
- * list, not policy_json's exclude_globs, which remains unenforced — see the
- * capability table in README.md. A caller that needs different exclusions
- * cannot express them
- * yet, and pretending otherwise would put a policy field in a listing hash
- * that nothing actually consults. */
-static int excluded_entry_name(const char *name) {
+/* Generated trees are pruned before their contents are enumerated. Compare
+ * case-insensitively because common filesystems used for user folders are
+ * case-insensitive, and the policy should behave the same on copied trees. */
+static int excluded_entry_name(const char *name,
+                               const chutni_root_policy *policy) {
     static const char *skip[] = {
         ".git", ".svn", ".hg", "node_modules", ".cache", "__pycache__",
-        ".venv", "venv", "target", ".Trash", NULL
+        ".venv", "venv", "env", "target", "build", "dist", "DerivedData",
+        ".Trash", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+        "site-packages", ".next", ".nuxt", ".yarn", ".pnpm-store",
+        ".gradle", "coverage", ".idea", NULL
     };
     for (const char **p = skip; *p; p++)
-        if (!strcmp(name, *p)) return 1;
+        if (!strcasecmp(name, *p)) return 1;
+    if (policy && policy->exclude_globs) {
+        for (const char *const *p = policy->exclude_globs; *p; p++)
+            if (fnmatch(*p, name, 0) == 0) return 1;
+    }
     return 0;
+}
+
+/* A Python environment can have any name. Probe only the known marker with
+ * lstat; never enumerate the candidate directory to identify it. */
+static int is_python_environment(const char *dir, const char *name) {
+    char candidate[PATH_MAX];
+    struct stat st;
+    int n = snprintf(candidate, sizeof candidate, "%s/%s/pyvenv.cfg", dir, name);
+    return n >= 0 && (size_t)n < sizeof candidate &&
+           lstat(candidate, &st) == 0 && S_ISREG(st.st_mode);
 }
 
 static int dir_entry_cmp(const void *a, const void *b) {
@@ -1622,7 +1639,7 @@ chutni_status chutni_read_directory(const char *dir,
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         if (e->d_name[0] == '.' && !policy->include_hidden) { skipped++; continue; }
-        if (excluded_entry_name(e->d_name)) { skipped++; continue; }
+        if (excluded_entry_name(e->d_name, policy)) { skipped++; continue; }
 
         char full[PATH_MAX];
         if ((size_t)snprintf(full, sizeof full, "%s/%s", dir, e->d_name) >= sizeof full) {
@@ -1631,12 +1648,15 @@ chutni_status chutni_read_directory(const char *dir,
         }
         struct stat st;
         if (lstat(full, &st) != 0) { odd++; continue; }
-        if (S_ISLNK(st.st_mode)) {
-            if (!policy->follow_symlinks) { skipped++; continue; }
-            if (stat(full, &st) != 0) { odd++; continue; }
-        }
+        /* Folder scans never follow links. This is an application safety
+         * boundary and cannot be relaxed by a stored root policy. */
+        if (S_ISLNK(st.st_mode)) { skipped++; continue; }
         int is_directory = S_ISDIR(st.st_mode) != 0;
         if (!is_directory && !S_ISREG(st.st_mode)) { odd++; continue; }
+        if (is_directory && is_python_environment(dir, e->d_name)) {
+            skipped++;
+            continue;
+        }
 
         if (n == cap) {
             size_t c = cap ? cap * 2 : 32;
@@ -4301,6 +4321,7 @@ static chutni_status jcall_op_add_root(chutni_store *s, const cj *args, cj **out
     const char *path = jarg_str(args, "path");
     if (!path || !*path) return fail(s, CHUTNI_ERR_INVALID, "path is required");
     chutni_root_policy policy;
+    const char **exclude_globs = NULL;
     chutni_root_policy_defaults(&policy);
     cj *p = cj_get(args, "policy");
     if (p && p->type != CJ_OBJ)
@@ -4315,12 +4336,25 @@ static chutni_status jcall_op_add_root(chutni_store *s, const cj *args, cj **out
         if (n && n->type == CJ_NUM && n->num > 0) policy.max_file_size_bytes = (uint64_t)n->num;
         n = cj_get(p, "max_depth");
         if (n && n->type == CJ_NUM && n->num >= 0) policy.max_depth = (int)n->num;
+        n = cj_get(p, "exclude_globs");
+        if (n && n->type == CJ_ARR && n->n) {
+            exclude_globs = calloc(n->n + 1, sizeof(*exclude_globs));
+            if (!exclude_globs)
+                return fail(s, CHUTNI_ERR_NOMEM, "cannot allocate exclusion policy");
+            size_t used = 0;
+            for (size_t i = 0; i < n->n; i++) {
+                if (n->items[i] && n->items[i]->type == CJ_STR && n->items[i]->str)
+                    exclude_globs[used++] = n->items[i]->str;
+            }
+            policy.exclude_globs = exclude_globs;
+        }
         policy.memory_goal = jarg_str(p, "memory_goal");
         policy.definition_mode = jarg_str(p, "definition_mode");
     }
     char root_id[CHUTNI_ID_STRLEN];
     chutni_status status = chutni_root_add(s, path, jarg_str(args, "label"),
                                            &policy, root_id);
+    free(exclude_globs);
     if (status != CHUTNI_OK) return status;
     cj *result = cj_obj();
     cj_set(result, "root_id", cj_str(root_id));

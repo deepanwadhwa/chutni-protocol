@@ -272,6 +272,9 @@ static void set_scan_result(cj *object, const chutni_scan_result *scan) {
     cj_set(value, "deepest_directory_enumerated",
            cj_num((double)scan->deepest_directory_enumerated));
     cj_set(value, "complete_for_policy", cj_bool(scan->complete_for_policy));
+    cj_set(value, "partial", cj_bool(scan->partial));
+    if (scan->limiting_reason)
+        cj_set(value, "limiting_reason", cj_str(scan->limiting_reason));
     if (scan->depth_limited_directories)
         cj_set(value, "note",
                cj_str("complete_for_policy reports that the bounded operation "
@@ -419,6 +422,12 @@ static cj *tool_folder_activate(const cj *arguments, int *is_error) {
     cj *max_value = cj_get(arguments, "max_file_size_bytes");
     if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
         options.max_file_size_bytes = (uint64_t)max_value->num;
+    int max_files = argument_int(arguments, "max_files", 0);
+    int max_directories = argument_int(arguments, "max_directories", 0);
+    int max_seconds = argument_int(arguments, "max_seconds", 0);
+    if (max_files > 0) options.max_files = (uint64_t)max_files;
+    if (max_directories > 0) options.max_directories = (uint64_t)max_directories;
+    if (max_seconds > 0) options.max_seconds = (uint32_t)max_seconds;
     if (argument_bool(arguments, "report_progress", 0)) {
         options.progress_callback = report_scan_progress;
         options.progress_userdata = stderr;
@@ -1397,6 +1406,9 @@ static cj *tools_list(void) {
                schema_integer("Per-file scanner safety cap.", 1, -1));
         cj_set(properties, "max_depth",
                schema_integer("Depth bound recorded on the new root. The selected folder is depth 0; a directory at depth d is enumerated only when d <= max_depth, and deeper directories are recorded by name without being opened. Omit for unbounded recursion.", 0, -1));
+        cj_set(properties, "max_files", schema_integer("Maximum regular files admitted by this scan.", 1, 1000000));
+        cj_set(properties, "max_directories", schema_integer("Maximum directories whose entries may be enumerated, including the selected root.", 1, 100000));
+        cj_set(properties, "max_seconds", schema_integer("Maximum wall-clock seconds for this scan.", 1, 3600));
         cj_set(properties, "memory_goal",
                schema_string("Why this memory is being built, e.g. \"define\". Recorded on the root and echoed in every coverage manifest."));
         cj_set(properties, "definition_mode",

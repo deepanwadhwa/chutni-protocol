@@ -708,6 +708,25 @@ def main():
         }
         assert by_name["Drafts"]["source_kind"] == "directory"
         assert by_name["Drafts"]["observation"] == "opaque"
+
+        budget_source = root / "Budgeted"
+        budget_source.mkdir()
+        (budget_source / "one.txt").write_text("first\n", encoding="utf-8")
+        (budget_source / "two.txt").write_text("second\n", encoding="utf-8")
+        budgeted, failed = session.tool(
+            "chutni_folder_activate",
+            {
+                "path": str(budget_source),
+                "confirmed": True,
+                "max_files": 1,
+                "app_name": "test-host",
+                "app_version": "1.0",
+            },
+        )
+        assert not failed, budgeted
+        assert budgeted["scan"]["partial"] is True
+        assert budgeted["scan"]["complete_for_policy"] is False
+        assert budgeted["scan"]["limiting_reason"] == "maximum_files"
         assert by_name["paper.txt"]["source_kind"] == "file"
         assert by_name["paper.txt"]["depth"] == 2
 

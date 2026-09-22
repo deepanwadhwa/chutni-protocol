@@ -1516,6 +1516,122 @@ static void scenario_v01_compatibility(void) {
     chutni_close(store);
 }
 
+/* 19. Folder policy must prune generated roots, custom Python environments,
+   user exclusions, and links before their descendants enter the catalog. */
+static void scenario_safe_folder_policy(void) {
+    char tree[512], store_path[512], path[700], outside[700];
+    p(tree, sizeof tree, "safe-policy-tree");
+    p(store_path, sizeof store_path, "safe-policy.chutni");
+    make_dir(tree);
+
+    const char *generated[] = { ".venv", "NODE_MODULES", "build", NULL };
+    for (const char **name = generated; *name; name++) {
+        snprintf(path, sizeof path, "%s/%s", tree, *name);
+        make_dir(path);
+        snprintf(path, sizeof path, "%s/%s/decoy.md", tree, *name);
+        write_file(path, "decoy from generated output\n");
+    }
+    snprintf(path, sizeof path, "%s/custom-python-env", tree);
+    make_dir(path);
+    char marker[700];
+    snprintf(marker, sizeof marker, "%s/pyvenv.cfg", path);
+    write_file(marker, "home = /python\n");
+    snprintf(path, sizeof path, "%s/custom-python-env/decoy.md", tree);
+    write_file(path, "decoy from custom environment\n");
+
+    snprintf(path, sizeof path, "%s/private", tree);
+    make_dir(path);
+    snprintf(path, sizeof path, "%s/private/secret.md", tree);
+    write_file(path, "user excluded secret\n");
+    snprintf(path, sizeof path, "%s/visible.md", tree);
+    write_file(path, "visible source material\n");
+    p(outside, sizeof outside, "safe-policy-outside.txt");
+    write_file(outside, "outside target must not enter the catalog\n");
+    snprintf(path, sizeof path, "%s/escape", tree);
+    symlink(outside, path);
+    snprintf(path, sizeof path, "%s/cycle", tree);
+    symlink(tree, path);
+
+    chutni_store *store = NULL;
+    if (chutni_create(store_path, "safe policy", &store) != CHUTNI_OK) {
+        bad("19 safe folder policy", chutni_last_error(NULL));
+        return;
+    }
+    const char *globs[] = { "private", NULL };
+    chutni_root_policy policy;
+    chutni_root_policy_defaults(&policy);
+    policy.include_hidden = 1;
+    policy.follow_symlinks = 1; /* safety remains non-overridable */
+    policy.exclude_globs = globs;
+    char root_id[CHUTNI_ID_STRLEN];
+    if (chutni_root_add(store, tree, "tree", &policy, root_id) != CHUTNI_OK) {
+        bad("19 safe folder policy", chutni_last_error(store));
+        chutni_close(store);
+        return;
+    }
+    chutni_scan_options options;
+    memset(&options, 0, sizeof options);
+    options.app_name = "chutni-conformance";
+    options.app_version = "1";
+    chutni_scan_result result;
+    chutni_status status = chutni_scan(store, &options, &result);
+
+    char decoy[700], visible[700];
+    int absent = 1;
+    for (const char **name = generated; *name; name++) {
+        snprintf(decoy, sizeof decoy, "%s/%s/decoy.md", tree, *name);
+        if (source_exists(store, decoy)) absent = 0;
+    }
+    snprintf(decoy, sizeof decoy, "%s/custom-python-env/decoy.md", tree);
+    if (source_exists(store, decoy)) absent = 0;
+    snprintf(decoy, sizeof decoy, "%s/private/secret.md", tree);
+    if (source_exists(store, decoy)) absent = 0;
+    snprintf(path, sizeof path, "%s/escape", tree);
+    int link_absent = !source_exists(store, path);
+    snprintf(path, sizeof path, "%s/cycle", tree);
+    link_absent = link_absent && !source_exists(store, path);
+    snprintf(visible, sizeof visible, "%s/visible.md", tree);
+    check("19 generated roots, marker envs, and glob exclusions are pruned",
+          status == CHUTNI_OK && absent && source_exists(store, visible),
+          "eligible neighbor remains indexed");
+    check("19 symlink escapes and cycles remain unfollowed",
+          link_absent, "stored follow_symlinks cannot relax the safety rule");
+    chutni_close(store);
+}
+
+static void scenario_scan_file_budget(void) {
+    char tree[512], store_path[512];
+    p(tree, sizeof tree, "scan-budget-tree");
+    p(store_path, sizeof store_path, "scan-budget.chutni");
+    build_tree(tree);
+    chutni_store *store = NULL;
+    if (chutni_create(store_path, "scan budget", &store) != CHUTNI_OK) {
+        bad("20 scan file budget", chutni_last_error(NULL));
+        return;
+    }
+    chutni_root_policy policy;
+    chutni_root_policy_defaults(&policy);
+    char root_id[CHUTNI_ID_STRLEN];
+    if (chutni_root_add(store, tree, "tree", &policy, root_id) != CHUTNI_OK) {
+        bad("20 scan file budget", chutni_last_error(store));
+        chutni_close(store);
+        return;
+    }
+    chutni_scan_options options;
+    memset(&options, 0, sizeof options);
+    options.app_name = "chutni-conformance";
+    options.app_version = "1";
+    options.max_files = 1;
+    chutni_scan_result result;
+    chutni_status status = chutni_scan(store, &options, &result);
+    check("20 file budget is reported as a partial scan",
+          status == CHUTNI_OK && result.partial && !result.complete_for_policy &&
+          result.limiting_reason && !strcmp(result.limiting_reason, "maximum_files") &&
+          result.files_seen <= 1,
+          "bounded ingestion must not claim complete coverage");
+    chutni_close(store);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: conformance <work-dir>\n"); return 2; }
     snprintf(root_dir, sizeof root_dir, "%s", argv[1]);
@@ -1550,6 +1666,8 @@ int main(int argc, char **argv) {
     scenario_partial_scan_safety();
     scenario_coverage_is_legible();
     scenario_v01_compatibility();
+    scenario_safe_folder_policy();
+    scenario_scan_file_budget();
 
     printf("\n%d passed, %d failed, %d gaps\n", passes, failures, gaps);
     if (gaps) printf("Gaps are unimplemented scenarios, not passes.\n");
