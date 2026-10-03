@@ -41,6 +41,7 @@ typedef struct {
     char store_path[PATH_MAX];
     char root_id[CHUTNI_ID_STRLEN];
     char store_id[CHUTNI_ID_STRLEN];
+    char root_policy_json[2048];
 } folder_resolution;
 
 static cj *json_clone(const cj *value) {
@@ -140,7 +141,8 @@ static int directory_has_manifest(const char *path) {
 }
 
 static int root_matches_source(chutni_store *store, const char *source_path,
-                               char root_id[CHUTNI_ID_STRLEN]) {
+                               char root_id[CHUTNI_ID_STRLEN],
+                               char *policy_json, size_t policy_json_cap) {
     chutni_root_info *roots = NULL;
     size_t count = 0;
     if (chutni_roots_list(store, &roots, &count) != CHUTNI_OK) return 0;
@@ -149,6 +151,8 @@ static int root_matches_source(chutni_store *store, const char *source_path,
         if (roots[i].path && !strcmp(roots[i].path, source_path)) {
             if (root_id)
                 snprintf(root_id, CHUTNI_ID_STRLEN, "%s", roots[i].root_id);
+            if (policy_json && policy_json_cap && roots[i].policy_json)
+                snprintf(policy_json, policy_json_cap, "%s", roots[i].policy_json);
             found = 1;
             break;
         }
@@ -198,8 +202,9 @@ static chutni_status resolve_folder(const char *path, folder_resolution *out) {
     out->store_valid = 1;
     snprintf(out->store_id, sizeof out->store_id, "%s",
              chutni_store_id(store));
-    out->root_matches =
-        root_matches_source(store, out->source_path, out->root_id);
+    out->root_matches = root_matches_source(
+        store, out->source_path, out->root_id, out->root_policy_json,
+        sizeof out->root_policy_json);
     chutni_close(store);
     return CHUTNI_OK;
 }
@@ -231,6 +236,10 @@ static cj *resolution_json(const folder_resolution *resolution) {
     cj_set(result, "store_exists", cj_bool(resolution->store_exists));
     cj_set(result, "store_valid", cj_bool(resolution->store_valid));
     cj_set(result, "root_authorized", cj_bool(resolution->root_matches));
+    if (resolution->root_policy_json[0]) {
+        cj *policy = cj_parse(resolution->root_policy_json, NULL);
+        cj_set(result, "root_policy", policy ? policy : cj_null());
+    }
     cj_set(result, "action", cj_str(resolution_action(resolution)));
     if (resolution->store_id[0])
         cj_set(result, "store_id", cj_str(resolution->store_id));
@@ -273,6 +282,7 @@ static void set_scan_result(cj *object, const chutni_scan_result *scan) {
            cj_num((double)scan->deepest_directory_enumerated));
     cj_set(value, "complete_for_policy", cj_bool(scan->complete_for_policy));
     cj_set(value, "partial", cj_bool(scan->partial));
+    cj_set(value, "eligible_bytes", cj_num((double)scan->eligible_bytes));
     if (scan->limiting_reason)
         cj_set(value, "limiting_reason", cj_str(scan->limiting_reason));
     if (scan->depth_limited_directories)
@@ -395,6 +405,43 @@ static cj *tool_folder_activate(const cj *arguments, int *is_error) {
        max_depth stays unbounded — the v0.1 meaning. */
     chutni_root_policy policy;
     chutni_root_policy_defaults(&policy);
+    int inventory_policy_version = argument_int(arguments,
+                                                 "inventory_policy_version", 0);
+    if (inventory_policy_version > 0)
+        policy.inventory_policy_version = inventory_policy_version;
+    cj *file_limit = cj_get(arguments, "max_file_size_bytes");
+    if (file_limit && file_limit->type == CJ_NUM && file_limit->num > 0)
+        policy.scan_max_file_size_bytes = (uint64_t)file_limit->num;
+    cj *aggregate_limit = cj_get(arguments, "max_eligible_bytes");
+    if (aggregate_limit && aggregate_limit->type == CJ_NUM &&
+        aggregate_limit->num > 0)
+        policy.max_eligible_bytes = (uint64_t)aggregate_limit->num;
+    const char **exclude_globs = NULL;
+    cj *exclude_value = cj_get(arguments, "exclude_globs");
+    if (exclude_value) {
+        if (exclude_value->type != CJ_ARR || exclude_value->n > 16) {
+            chutni_close(store);
+            *is_error = 1;
+            return tool_error("invalid_policy", "exclude_globs must contain at most 16 folder names.");
+        }
+        exclude_globs = calloc(exclude_value->n + 1, sizeof(*exclude_globs));
+        if (!exclude_globs) {
+            chutni_close(store);
+            *is_error = 1;
+            return tool_error("out_of_memory", "Cannot allocate the folder exclusion policy.");
+        }
+        for (size_t i = 0; i < exclude_value->n; i++) {
+            cj *item = exclude_value->items[i];
+            if (!item || item->type != CJ_STR || !item->str || !item->str[0]) {
+                free(exclude_globs);
+                chutni_close(store);
+                *is_error = 1;
+                return tool_error("invalid_policy", "Every folder exclusion must be a non-empty string.");
+            }
+            exclude_globs[i] = item->str;
+        }
+        policy.exclude_globs = exclude_globs;
+    }
     cj *depth_value = cj_get(arguments, "max_depth");
     if (depth_value && depth_value->type == CJ_NUM && depth_value->num >= 0)
         policy.max_depth = (int)depth_value->num;
@@ -403,9 +450,32 @@ static cj *tool_folder_activate(const cj *arguments, int *is_error) {
 
     char root_id[CHUTNI_ID_STRLEN] = {0};
     if (resolution.source_path[0]) {
-        status = chutni_root_add(store, resolution.source_path,
-                                 argument_string(arguments, "label"), &policy,
-                                 root_id);
+        if (argument_bool(arguments, "rebuild_existing", 0)) {
+            chutni_root_info *roots = NULL;
+            size_t root_count = 0;
+            status = chutni_roots_list(store, &roots, &root_count);
+            if (status == CHUTNI_OK) {
+                int found = 0;
+                for (size_t i = 0; i < root_count; ++i) {
+                    if (roots[i].path &&
+                        !strcmp(roots[i].path, resolution.source_path)) {
+                        snprintf(root_id, sizeof root_id, "%s", roots[i].root_id);
+                        found = 1;
+                        break;
+                    }
+                }
+                chutni_root_info_free(roots, root_count);
+                status = found
+                    ? chutni_root_reset(store, root_id, &policy)
+                    : CHUTNI_ERR_NOTFOUND;
+            }
+        } else {
+            status = chutni_root_add(store, resolution.source_path,
+                                     argument_string(arguments, "label"), &policy,
+                                     root_id);
+        }
+        free(exclude_globs);
+        exclude_globs = NULL;
         if (status != CHUTNI_OK) {
             cj *error = status_error("Cannot authorize selected root", status,
                                      store);
@@ -414,6 +484,7 @@ static cj *tool_folder_activate(const cj *arguments, int *is_error) {
             return error;
         }
     }
+    free(exclude_globs);
 
     chutni_scan_options options;
     memset(&options, 0, sizeof options);
@@ -422,6 +493,10 @@ static cj *tool_folder_activate(const cj *arguments, int *is_error) {
     cj *max_value = cj_get(arguments, "max_file_size_bytes");
     if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
         options.max_file_size_bytes = (uint64_t)max_value->num;
+    cj *max_eligible_value = cj_get(arguments, "max_eligible_bytes");
+    if (max_eligible_value && max_eligible_value->type == CJ_NUM &&
+        max_eligible_value->num > 0)
+        options.max_eligible_bytes = (uint64_t)max_eligible_value->num;
     int max_files = argument_int(arguments, "max_files", 0);
     int max_directories = argument_int(arguments, "max_directories", 0);
     int max_seconds = argument_int(arguments, "max_seconds", 0);
@@ -545,7 +620,7 @@ static cj *tool_list_sources(const cj *arguments, int *is_error) {
                             NULL);
     }
     char root_id[CHUTNI_ID_STRLEN];
-    if (!root_matches_source(store, source_path, root_id)) {
+    if (!root_matches_source(store, source_path, root_id, NULL, 0)) {
         chutni_close(store);
         *is_error = 1;
         return tool_error(
@@ -1395,6 +1470,8 @@ static cj *tools_list(void) {
                schema_string("The exact source directory or store path the user selected."));
         cj_set(properties, "confirmed",
                schema_boolean("Must be true only after the user approves the reported store path and scan."));
+        cj_set(properties, "rebuild_existing",
+               schema_boolean("For an already-authorized root only: after explicit user approval, discard its indexed sources and derived artifacts before rebuilding under a changed inventory policy."));
         cj_set(properties, "label", schema_string("Optional user-visible label."));
         cj_set(properties, "register",
                schema_boolean("Register a newly created store for discovery."));
@@ -1416,7 +1493,7 @@ static cj *tools_list(void) {
         const char *required[] = {"path", "confirmed", NULL};
         cj_push(tools, tool_definition(
             "chutni_folder_activate", "Create or open Chutni memory",
-            "After explicit user confirmation, create or open the adjacent P.chutni store, authorize P as a root, and scan it using the shared reference scanner.",
+            "After explicit user confirmation, create or open the adjacent P.chutni store, authorize P as a root, and scan it using the shared reference scanner. Set rebuild_existing only when the user explicitly confirmed discarding the old index for this authorized root.",
             input_schema(properties, required), 0, 0, 1));
     }
     {

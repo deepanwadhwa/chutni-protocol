@@ -1029,9 +1029,15 @@ Field meanings that are easy to overstate:
   open because of `max_depth`.
 
 **`complete_for_policy` means Chutni completed the requested bounded
-operation.** It does not mean the complete subtree was read. A consumer MUST
-NOT translate it into a claim of exhaustive coverage, and an implementation
-presenting it to a user or a model SHOULD say which one it means.
+operation.** `partial` separately reports that the selected subtree contains
+known content left outside the scan, including directories left opaque by an
+explicit `max_depth`. Therefore `partial: true` with
+`complete_for_policy: true` is valid when the accepted depth policy was
+completed successfully. Resource, file, directory, or deadline limits that
+interrupt the accepted operation set `complete_for_policy: false`. Neither
+field alone means the complete subtree was read. A consumer MUST NOT translate
+`complete_for_policy` into a claim of exhaustive coverage, and an
+implementation presenting these fields to a user or model SHOULD explain both.
 
 A new generation's manifest SHOULD supersede the previous one (§23) rather than
 replace it: how far a past scan reached is part of the store's history. A

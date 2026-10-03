@@ -139,6 +139,13 @@ typedef struct {
      * standardize the prompt, the classifier, or the category vocabulary. */
     const char *memory_goal;
     const char *definition_mode;
+    /* Optional host-specific byte ceilings retained with the authorized
+       root. Zero preserves the reference API's defaults. */
+    uint64_t max_eligible_bytes;
+    uint64_t scan_max_file_size_bytes;
+    /* Host inventory-policy generation, retained so callers can reject old
+       indexes whose traversal semantics predate the accepted preview. */
+    int inventory_policy_version;
 } chutni_root_policy;
 
 void chutni_root_policy_defaults(chutni_root_policy *policy);
@@ -339,6 +346,15 @@ chutni_status chutni_read_directory(const char *dir,
                                     chutni_dir_entry **out, size_t *count,
                                     uint64_t *excluded, uint64_t *unsupported,
                                     char hash_out[CHUTNI_HASH_STRLEN]);
+/* Scanner variant: returns entries in native readdir order so traversal
+ * budgets agree with the streaming host inventory. The listing hash remains
+ * canonical and independent of filesystem enumeration order. */
+chutni_status chutni_read_directory_ordered(
+                                    const char *dir,
+                                    const chutni_root_policy *policy,
+                                    chutni_dir_entry **out, size_t *count,
+                                    uint64_t *excluded, uint64_t *unsupported,
+                                    char hash_out[CHUTNI_HASH_STRLEN]);
 void chutni_dir_entry_free(chutni_dir_entry *entries, size_t count);
 
 /* Hash of one immediate directory listing, in "blake3:<hex>" form (§13.5).
@@ -400,6 +416,9 @@ typedef struct {
     uint64_t max_files;
     uint64_t max_directories;
     uint32_t max_seconds;
+    /* Total bytes admitted to the scan, counting only files under
+       max_file_size_bytes. Zero leaves the reference API unbounded. */
+    uint64_t max_eligible_bytes;
 } chutni_scan_options;
 
 typedef struct chutni_scan_result {
@@ -427,6 +446,7 @@ typedef struct chutni_scan_result {
     int      complete_for_policy;
     int      partial;
     const char *limiting_reason; /* static string, valid with this result */
+    uint64_t eligible_bytes;     /* admitted file bytes under this scan's cap */
 } chutni_scan_result;
 
 /* Scan every root recorded in the store, then rebuild disposable indexes.
@@ -536,6 +556,11 @@ typedef enum {
 
 chutni_status chutni_forget_source(chutni_store *store, const char *source_id,
                                    chutni_forget_mode mode);
+
+/* Atomically discard a root's previous sources and artifacts, retain the
+ * authorized root record, and replace its traversal policy before a rebuild. */
+chutni_status chutni_root_reset(chutni_store *store, const char *root_id,
+                                const chutni_root_policy *policy);
 
 /* ---------------------------------------------------------------- artifacts */
 

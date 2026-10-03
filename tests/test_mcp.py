@@ -687,6 +687,8 @@ def main():
         bounded_store = bounded["store_path"]
         assert bounded["scan"]["directories_enumerated"] == 3
         assert bounded["scan"]["depth_limited_directories"] == 1
+        assert bounded["scan"]["partial"] is True
+        assert bounded["scan"]["limiting_reason"] == "maximum_depth"
         assert bounded["scan"]["complete_for_policy"] is True
         assert "exhaustive index" in bounded["scan"]["note"]
 

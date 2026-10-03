@@ -855,6 +855,9 @@ void chutni_root_policy_defaults(chutni_root_policy *p) {
     p->max_depth = CHUTNI_DEPTH_UNBOUNDED;
     p->memory_goal = NULL;
     p->definition_mode = NULL;
+    p->max_eligible_bytes = 0;
+    p->scan_max_file_size_bytes = 0;
+    p->inventory_policy_version = 0;
 }
 
 static char *policy_to_json(const chutni_root_policy *p) {
@@ -865,6 +868,14 @@ static char *policy_to_json(const chutni_root_policy *p) {
     cj_set(o, "include_hidden", cj_bool(p->include_hidden));
     cj_set(o, "retain_deleted_artifacts", cj_bool(p->retain_deleted_artifacts));
     cj_set(o, "max_file_size_bytes", cj_num((double)p->max_file_size_bytes));
+    if (p->max_eligible_bytes)
+        cj_set(o, "max_eligible_bytes", cj_num((double)p->max_eligible_bytes));
+    if (p->scan_max_file_size_bytes)
+        cj_set(o, "scan_max_file_size_bytes",
+               cj_num((double)p->scan_max_file_size_bytes));
+    if (p->inventory_policy_version > 0)
+        cj_set(o, "inventory_policy_version",
+               cj_num((double)p->inventory_policy_version));
     cj *globs = cj_arr();
     if (p->exclude_globs)
         for (const char *const *g = p->exclude_globs; *g; g++) cj_push(globs, cj_str(*g));
@@ -962,6 +973,24 @@ chutni_status chutni_root_add(chutni_store *s, const char *dir, const char *labe
         if (sqlite3_step(q) == SQLITE_ROW) {
             snprintf(root_id, CHUTNI_ID_STRLEN, "%s", (const char *)sqlite3_column_text(q, 0));
             sqlite3_finalize(q);
+            if (policy) {
+                char *pol = policy_to_json(policy);
+                if (!pol) return CHUTNI_ERR_NOMEM;
+                if (sqlite3_prepare_v2(s->db,
+                        "UPDATE roots SET policy_json=?2 WHERE root_id=?1",
+                        -1, &q, NULL) != SQLITE_OK) {
+                    free(pol);
+                    return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+                }
+                sqlite3_bind_text(q, 1, root_id, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(q, 2, pol, -1, SQLITE_TRANSIENT);
+                int update_rc = sqlite3_step(q);
+                sqlite3_finalize(q);
+                free(pol);
+                if (update_rc != SQLITE_DONE)
+                    return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+                manifest_save(s);
+            }
             return CHUTNI_OK;
         }
         sqlite3_finalize(q);
@@ -1543,8 +1572,16 @@ static int excluded_entry_name(const char *name,
     for (const char **p = skip; *p; p++)
         if (!strcasecmp(name, *p)) return 1;
     if (policy && policy->exclude_globs) {
-        for (const char *const *p = policy->exclude_globs; *p; p++)
-            if (fnmatch(*p, name, 0) == 0) return 1;
+        for (const char *const *p = policy->exclude_globs; *p; p++) {
+            /* Exact user names follow the app's conservative case-insensitive
+               matching on common case-insensitive user volumes. Glob policy
+               retains standard fnmatch semantics. */
+            if (!strpbrk(*p, "*?[")) {
+                if (!strcasecmp(*p, name)) return 1;
+            } else if (fnmatch(*p, name, 0) == 0) {
+                return 1;
+            }
+        }
     }
     return 0;
 }
@@ -1617,11 +1654,12 @@ void chutni_dir_entry_free(chutni_dir_entry *entries, size_t count) {
     free(entries);
 }
 
-chutni_status chutni_read_directory(const char *dir,
+static chutni_status read_directory_impl(const char *dir,
                                     const chutni_root_policy *policy,
                                     chutni_dir_entry **out, size_t *count,
                                     uint64_t *excluded, uint64_t *unsupported,
-                                    char hash_out[CHUTNI_HASH_STRLEN]) {
+                                    char hash_out[CHUTNI_HASH_STRLEN],
+                                    int preserve_readdir_order) {
     if (!dir) return CHUTNI_ERR_INVALID;
     if (out) *out = NULL;
     if (count) *count = 0;
@@ -1653,6 +1691,14 @@ chutni_status chutni_read_directory(const char *dir,
         if (S_ISLNK(st.st_mode)) { skipped++; continue; }
         int is_directory = S_ISDIR(st.st_mode) != 0;
         if (!is_directory && !S_ISREG(st.st_mode)) { odd++; continue; }
+        /* Portable stores are generated evidence, never source documents.
+         * Match the host inventory policy even for another root's store. */
+        size_t name_length = strlen(e->d_name);
+        if (is_directory && name_length > 7 &&
+            !strcasecmp(e->d_name + name_length - 7, ".chutni")) {
+            skipped++;
+            continue;
+        }
         if (is_directory && is_python_environment(dir, e->d_name)) {
             skipped++;
             continue;
@@ -1679,38 +1725,70 @@ chutni_status chutni_read_directory(const char *dir,
     }
     closedir(d);
 
-    /* Readdir order is not defined and differs between filesystems, so the
-       canonical form sorts. Two computers observing the same directory must
-       compute the same hash or freshness means nothing across a copied store. */
-    if (vec) qsort(vec, n, sizeof *vec, dir_entry_cmp);
-
+    /* Traversal may retain native order to match the streaming metadata
+       inventory. Hashing always uses a sorted shallow copy so the stable
+       directory identity remains portable across filesystems. */
+    chutni_dir_entry *canonical = NULL;
+    if (hash_out && n) {
+        canonical = malloc(n * sizeof *canonical);
+        if (!canonical) {
+            chutni_dir_entry_free(vec, n);
+            return CHUTNI_ERR_NOMEM;
+        }
+        memcpy(canonical, vec, n * sizeof *canonical);
+        qsort(canonical, n, sizeof *canonical, dir_entry_cmp);
+    }
     if (hash_out) {
         char *buf = NULL;
         size_t len = 0, bcap = 0;
         append_raw(&buf, &len, &bcap, "chutni-listing-1\n");
         for (size_t i = 0; i < n; i++) {
-            append_escaped(&buf, &len, &bcap, vec[i].name);
+            append_escaped(&buf, &len, &bcap, canonical[i].name);
             append_raw(&buf, &len, &bcap, "\t");
-            append_raw(&buf, &len, &bcap, vec[i].source_kind);
+            append_raw(&buf, &len, &bcap, canonical[i].source_kind);
             append_raw(&buf, &len, &bcap, "\n");
         }
         if (!buf) {
+            free(canonical);
             chutni_dir_entry_free(vec, n);
             return CHUTNI_ERR_NOMEM;
         }
         chutni_status hs = chutni_hash_bytes(buf, len, hash_out);
         free(buf);
+        free(canonical);
         if (hs != CHUTNI_OK) {
             chutni_dir_entry_free(vec, n);
             return hs;
         }
     }
 
+    if (!preserve_readdir_order && vec)
+        qsort(vec, n, sizeof *vec, dir_entry_cmp);
+
     if (excluded) *excluded = skipped;
     if (unsupported) *unsupported = odd;
     if (out) { *out = vec; if (count) *count = n; }
     else chutni_dir_entry_free(vec, n);
     return CHUTNI_OK;
+}
+
+chutni_status chutni_read_directory(const char *dir,
+                                    const chutni_root_policy *policy,
+                                    chutni_dir_entry **out, size_t *count,
+                                    uint64_t *excluded, uint64_t *unsupported,
+                                    char hash_out[CHUTNI_HASH_STRLEN]) {
+    return read_directory_impl(dir, policy, out, count, excluded, unsupported,
+                               hash_out, 0);
+}
+
+chutni_status chutni_read_directory_ordered(
+                                    const char *dir,
+                                    const chutni_root_policy *policy,
+                                    chutni_dir_entry **out, size_t *count,
+                                    uint64_t *excluded, uint64_t *unsupported,
+                                    char hash_out[CHUTNI_HASH_STRLEN]) {
+    return read_directory_impl(dir, policy, out, count, excluded, unsupported,
+                               hash_out, 1);
 }
 
 chutni_status chutni_directory_listing_hash(const char *dir,
@@ -2445,6 +2523,160 @@ chutni_status chutni_forget_source(chutni_store *s, const char *source_id,
         sql_exec(s, "DELETE FROM objects WHERE object_hash NOT IN"
                     " (SELECT object_hash FROM artifacts WHERE object_hash IS NOT NULL"
                     "  UNION SELECT object_hash FROM representations)");
+    }
+    return CHUTNI_OK;
+}
+
+chutni_status chutni_root_reset(chutni_store *s, const char *root_id,
+                                const chutni_root_policy *policy) {
+    if (!s || !root_id || !*root_id || !policy) return CHUTNI_ERR_INVALID;
+    if (s->read_only) return fail(s, CHUTNI_ERR_READONLY, "store is read-only");
+
+    chutni_root_info *roots = NULL;
+    size_t root_count = 0;
+    if (chutni_roots_list(s, &roots, &root_count) != CHUTNI_OK)
+        return CHUTNI_ERR_DB;
+    const char *root_path = NULL;
+    for (size_t i = 0; i < root_count; i++)
+        if (roots[i].root_id && !strcmp(roots[i].root_id, root_id)) {
+            root_path = roots[i].path ? strdup(roots[i].path) : NULL;
+            break;
+        }
+    chutni_root_info_free(roots, root_count);
+    if (!root_path) return CHUTNI_ERR_NOTFOUND;
+
+    char root_source_id[CHUTNI_ID_STRLEN] = {0};
+    chutni_status status = chutni_source_find(s, root_path, root_source_id);
+    free((void *)root_path);
+    if (status != CHUTNI_OK) return status;
+    char *policy_json = policy_to_json(policy);
+    if (!policy_json) return CHUTNI_ERR_NOMEM;
+    if (!sql_exec(s, "BEGIN IMMEDIATE")) {
+        free(policy_json);
+        return CHUTNI_ERR_DB;
+    }
+
+    sqlite3_stmt *q = NULL;
+    int ok = 1;
+    if (s->have_index) {
+        ok = sqlite3_prepare_v2(s->db,
+            "DELETE FROM idx.artifacts_fts WHERE source_id IN"
+            " (SELECT source_id FROM sources WHERE root_id=?1)",
+            -1, &q, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_text(q, 1, root_id, -1, SQLITE_TRANSIENT);
+            ok = sqlite3_step(q) == SQLITE_DONE;
+            sqlite3_finalize(q); q = NULL;
+        }
+    }
+    if (ok) ok = sqlite3_prepare_v2(s->db,
+        "DELETE FROM representations WHERE artifact_id IN"
+        " (SELECT artifact_id FROM artifacts WHERE source_id IN"
+        "  (SELECT source_id FROM sources WHERE root_id=?1))",
+        -1, &q, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(q, 1, root_id, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(q) == SQLITE_DONE;
+        sqlite3_finalize(q); q = NULL;
+    }
+    if (ok) ok = sqlite3_prepare_v2(s->db,
+        "DELETE FROM artifacts WHERE source_id IN"
+        " (SELECT source_id FROM sources WHERE root_id=?1)",
+        -1, &q, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(q, 1, root_id, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(q) == SQLITE_DONE;
+        sqlite3_finalize(q); q = NULL;
+    }
+    if (ok) ok = sqlite3_prepare_v2(s->db,
+        "DELETE FROM relations WHERE from_id IN"
+        " (SELECT source_id FROM sources WHERE root_id=?1) OR to_id IN"
+        " (SELECT source_id FROM sources WHERE root_id=?1)",
+        -1, &q, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(q, 1, root_id, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(q) == SQLITE_DONE;
+        sqlite3_finalize(q); q = NULL;
+    }
+    if (ok) ok = sqlite3_prepare_v2(s->db,
+        "UPDATE sources SET parent_source_id=NULL WHERE root_id=?1 AND source_id<>?2",
+        -1, &q, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(q, 1, root_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 2, root_source_id, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(q) == SQLITE_DONE;
+        sqlite3_finalize(q); q = NULL;
+    }
+    if (ok) ok = sqlite3_prepare_v2(s->db,
+        "DELETE FROM sources WHERE root_id=?1 AND source_id<>?2",
+        -1, &q, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(q, 1, root_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 2, root_source_id, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(q) == SQLITE_DONE;
+        sqlite3_finalize(q); q = NULL;
+    }
+    if (ok) ok = sqlite3_prepare_v2(s->db,
+        "UPDATE sources SET content_hash=NULL,quick_hash=NULL,size_bytes=0,"
+        " state='present',last_scanned_at=NULL WHERE source_id=?1",
+        -1, &q, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(q, 1, root_source_id, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(q) == SQLITE_DONE;
+        sqlite3_finalize(q); q = NULL;
+    }
+    if (ok) ok = sqlite3_prepare_v2(s->db,
+        "UPDATE roots SET policy_json=?2 WHERE root_id=?1", -1, &q, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(q, 1, root_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(q, 2, policy_json, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(q) == SQLITE_DONE && sqlite3_changes(s->db) == 1;
+        sqlite3_finalize(q); q = NULL;
+    }
+    free(policy_json);
+    if (!ok) {
+        if (q) sqlite3_finalize(q);
+        sql_exec(s, "ROLLBACK");
+        return fail(s, CHUTNI_ERR_DB, "cannot reset authorized root");
+    }
+    if (!sql_exec(s, "COMMIT")) return CHUTNI_ERR_DB;
+
+    /* Remove payloads that became unreachable, while preserving content shared
+       with another root or standalone artifact. */
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT relative_path FROM objects WHERE object_hash NOT IN"
+            " (SELECT object_hash FROM artifacts WHERE object_hash IS NOT NULL"
+            "  UNION SELECT object_hash FROM representations)",
+            -1, &q, NULL) == SQLITE_OK) {
+        char **paths = NULL; size_t n = 0, cap = 0;
+        while (sqlite3_step(q) == SQLITE_ROW) {
+            const unsigned char *rel = sqlite3_column_text(q, 0);
+            if (!rel) continue;
+            if (n == cap) {
+                size_t next_cap = cap ? cap * 2 : 8;
+                char **next = realloc(paths, next_cap * sizeof *next);
+                if (!next) break;
+                paths = next; cap = next_cap;
+            }
+            paths[n] = strdup((const char *)rel);
+            if (paths[n]) n++;
+        }
+        sqlite3_finalize(q); q = NULL;
+        if (sqlite3_prepare_v2(s->db,
+                "DELETE FROM objects WHERE object_hash NOT IN"
+                " (SELECT object_hash FROM artifacts WHERE object_hash IS NOT NULL"
+                "  UNION SELECT object_hash FROM representations)",
+                -1, &q, NULL) == SQLITE_OK) {
+            sqlite3_step(q); sqlite3_finalize(q); q = NULL;
+            for (size_t i = 0; i < n; i++) {
+                char full[PATH_MAX];
+                if (path_join(full, sizeof full, s->path, paths[i])) unlink(full);
+                free(paths[i]);
+                paths[i] = NULL;
+            }
+        }
+        for (size_t i = 0; i < n; i++) free(paths[i]);
+        free(paths);
     }
     return CHUTNI_OK;
 }
@@ -4334,6 +4566,12 @@ static chutni_status jcall_op_add_root(chutni_store *s, const cj *args, cj **out
             jarg_bool(p, "retain_deleted_artifacts", policy.retain_deleted_artifacts);
         cj *n = cj_get(p, "max_file_size_bytes");
         if (n && n->type == CJ_NUM && n->num > 0) policy.max_file_size_bytes = (uint64_t)n->num;
+        n = cj_get(p, "max_eligible_bytes");
+        if (n && n->type == CJ_NUM && n->num > 0) policy.max_eligible_bytes = (uint64_t)n->num;
+        n = cj_get(p, "scan_max_file_size_bytes");
+        if (n && n->type == CJ_NUM && n->num > 0) policy.scan_max_file_size_bytes = (uint64_t)n->num;
+        n = cj_get(p, "inventory_policy_version");
+        if (n && n->type == CJ_NUM && n->num > 0) policy.inventory_policy_version = (int)n->num;
         n = cj_get(p, "max_depth");
         if (n && n->type == CJ_NUM && n->num >= 0) policy.max_depth = (int)n->num;
         n = cj_get(p, "exclude_globs");
@@ -4371,6 +4609,18 @@ static chutni_status jcall_op_scan(chutni_store *s, const cj *args, cj **out) {
     cj *max_value = cj_get(args, "max_file_size_bytes");
     if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
         options.max_file_size_bytes = (uint64_t)max_value->num;
+    max_value = cj_get(args, "max_eligible_bytes");
+    if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
+        options.max_eligible_bytes = (uint64_t)max_value->num;
+    max_value = cj_get(args, "max_files");
+    if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
+        options.max_files = (uint64_t)max_value->num;
+    max_value = cj_get(args, "max_directories");
+    if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
+        options.max_directories = (uint64_t)max_value->num;
+    max_value = cj_get(args, "max_seconds");
+    if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
+        options.max_seconds = (uint32_t)max_value->num;
     cj *depth_value = cj_get(args, "max_depth");
     if (depth_value && depth_value->type == CJ_NUM && depth_value->num >= 0) {
         options.use_override_max_depth = 1;

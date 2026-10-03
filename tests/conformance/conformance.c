@@ -1122,6 +1122,11 @@ static void scenario_bounded_depth(void) {
           "name observed, inside not");
     check("14 depth zero counts what it did not open",
           zero.depth_limited_directories == 2, "Alpha and Beta");
+    check("14 depth zero reports partial coverage with its limiting reason",
+          zero.partial && zero.limiting_reason &&
+          !strcmp(zero.limiting_reason, "maximum_depth") &&
+          zero.complete_for_policy,
+          "partial tree coverage; accepted bounded policy completed");
     chutni_close(store);
 
     /* Depth one adds the immediate child directories, and stops. */

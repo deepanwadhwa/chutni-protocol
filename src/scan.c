@@ -19,6 +19,7 @@
 #include "chutni.h"
 #include "cj.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +51,8 @@ typedef struct {
     char derivation_coverage[CHUTNI_ID_STRLEN];
     chutni_scan_result *result;
     uint64_t max_bytes;
+    uint64_t max_eligible_bytes;
+    uint64_t eligible_bytes;
     chutni_scan_progress_callback progress_callback;
     void *progress_userdata;
     uint64_t max_files;
@@ -58,6 +61,20 @@ typedef struct {
     uint32_t max_seconds;
     int stopped;
 } scan_context;
+
+/* Deterministic deadline seam for parity fixtures; unset in normal runs. */
+static void scan_test_delay(void) {
+    const char *raw = getenv("CHUTNI_TEST_SCAN_DELAY_US");
+    if (!raw || !*raw) return;
+    char *end = NULL;
+    unsigned long usec = strtoul(raw, &end, 10);
+    if (end == raw || *end || usec == 0 || usec > 10000000ul) return;
+    struct timespec delay = {
+        .tv_sec = (time_t)(usec / 1000000ul),
+        .tv_nsec = (long)(usec % 1000000ul) * 1000L,
+    };
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+}
 
 static uint64_t scan_monotonic_ms(void) {
     struct timespec ts;
@@ -73,6 +90,16 @@ static int scan_budget_expired(scan_context *sc) {
     sc->result->limiting_reason = "deadline";
     sc->stopped = 1;
     return 1;
+}
+
+/* Depth bounds intentionally leave opaque directories, so the scan is partial
+   relative to the selected tree while still completing its accepted policy.
+   Resource/deadline limits and errors make the accepted operation incomplete. */
+static int scan_complete_for_policy(const chutni_scan_result *result) {
+    return result && result->errors == 0 &&
+           (!result->partial ||
+            (result->limiting_reason &&
+             !strcmp(result->limiting_reason, "maximum_depth")));
 }
 
 static int looks_texty(const char *path) {
@@ -105,6 +132,12 @@ static int effective_max_depth(const char *policy_json,
         if (v && v->type == CJ_BOOL) policy_out->follow_symlinks = v->bval;
         v = cj_get(policy, "include_hidden");
         if (v && v->type == CJ_BOOL) policy_out->include_hidden = v->bval;
+        v = cj_get(policy, "scan_max_file_size_bytes");
+        if (v && v->type == CJ_NUM && v->num > 0)
+            policy_out->scan_max_file_size_bytes = (uint64_t)v->num;
+        v = cj_get(policy, "max_eligible_bytes");
+        if (v && v->type == CJ_NUM && v->num > 0)
+            policy_out->max_eligible_bytes = (uint64_t)v->num;
         v = cj_get(policy, "max_depth");
         if (v && v->type == CJ_NUM) depth = (int)v->num;
         v = cj_get(policy, "exclude_globs");
@@ -164,8 +197,28 @@ static void scan_file(scan_context *sc, const char *path, int depth,
             sc->result->errors++;
         }
         sc->result->skipped++;
+        sc->result->partial = 1;
+        sc->result->limiting_reason = "maximum_file_bytes";
         goto done;
     }
+
+    uint64_t file_bytes = size_bytes > 0 ? (uint64_t)size_bytes : 0;
+    if (sc->max_eligible_bytes &&
+        file_bytes > sc->max_eligible_bytes - sc->eligible_bytes) {
+        if (chutni_source_put(sc->store, sc->root_id, path, 0, source_id, NULL)
+                == CHUTNI_OK) {
+            chutni_source_set_state(sc->store, source_id, CHUTNI_SOURCE_EXCLUDED);
+            sc->result->sources_indexed++;
+        } else {
+            sc->result->errors++;
+        }
+        sc->result->skipped++;
+        sc->result->partial = 1;
+        sc->result->limiting_reason = "maximum_eligible_bytes";
+        sc->stopped = 1;
+        goto done;
+    }
+    sc->eligible_bytes += file_bytes;
 
     int changed = 0;
     if (chutni_source_put(sc->store, sc->root_id, path, 1, source_id,
@@ -401,6 +454,8 @@ static void handle_child_directory(scan_context *sc, const char *path,
             chutni_source_set_state(sc->store, child_id, CHUTNI_SOURCE_EXCLUDED);
         return;
     }
+    /* Both the metadata inventory and the scanner count the selected root as
+       directory 1 for this budget. */
     if (sc->max_directories &&
         sc->result->directories_enumerated >= sc->max_directories) {
         sc->result->partial = 1;
@@ -418,6 +473,13 @@ static void handle_child_directory(scan_context *sc, const char *path,
     if (may_expand && within_depth && depth < MAX_WALK_DEPTH) {
         observe(sc, path, parent_source_id, depth, 1, child_id);
         return;
+    }
+    if (may_expand && !within_depth) {
+        sc->result->partial = 1;
+        sc->result->limiting_reason = "maximum_depth";
+    } else if (may_expand && depth >= MAX_WALK_DEPTH) {
+        sc->result->partial = 1;
+        sc->result->limiting_reason = "maximum_depth";
     }
     sc->result->directories_observed++;
     sc->result->depth_limited_directories++;
@@ -444,7 +506,7 @@ static void observe(scan_context *sc, const char *dir_path,
     size_t count = 0;
     uint64_t excluded = 0, unsupported = 0;
     char listing_hash[CHUTNI_HASH_STRLEN];
-    if (chutni_read_directory(dir_path, &sc->policy, &entries, &count,
+    if (chutni_read_directory_ordered(dir_path, &sc->policy, &entries, &count,
                               &excluded, &unsupported, listing_hash) != CHUTNI_OK) {
         sc->result->errors++;
         /* Unreadable is still an observation worth recording: the directory
@@ -478,7 +540,9 @@ static void observe(scan_context *sc, const char *dir_path,
     }
 
     for (size_t i = 0; i < count; i++) {
-        if (sc->stopped || scan_budget_expired(sc)) break;
+        if (sc->stopped) break;
+        scan_test_delay();
+        if (scan_budget_expired(sc)) break;
         char full[PATH_MAX];
         if ((size_t)snprintf(full, sizeof full, "%s/%s", dir_path,
                              entries[i].name) >= sizeof full) {
@@ -576,6 +640,7 @@ static void count_definitions(chutni_store *store, const char *root_id,
 static void write_coverage_manifest(scan_context *sc, const char *root_source_id,
                                     const char *root_path,
                                     const char *scan_generation) {
+    sc->result->eligible_bytes = sc->eligible_bytes;
     char listing_hash[CHUTNI_HASH_STRLEN];
     if (chutni_directory_listing_hash(root_path, &sc->policy, listing_hash)
             != CHUTNI_OK) {
@@ -590,7 +655,7 @@ static void write_coverage_manifest(scan_context *sc, const char *root_source_id
     /* "Complete for policy" means the bounded operation the policy asked for
        ran to completion. It does not mean the subtree was read, and §15.7
        requires consumers to be told the difference. */
-    sc->result->complete_for_policy = sc->result->errors == 0 && !sc->result->partial;
+    sc->result->complete_for_policy = scan_complete_for_policy(sc->result);
 
     cj *payload = cj_obj();
     cj_set(payload, "scan_generation", cj_str(scan_generation));
@@ -632,6 +697,8 @@ static void write_coverage_manifest(scan_context *sc, const char *root_source_id
     cj_set(coverage, "directories_defined", cj_num((double)dirs_defined));
     cj_set(coverage, "directories_collapsed", cj_num((double)dirs_collapsed));
     cj_set(coverage, "files_observed", cj_num((double)sc->result->files_seen));
+    cj_set(coverage, "eligible_bytes",
+           cj_num((double)sc->result->eligible_bytes));
     cj_set(coverage, "files_hashed", cj_num((double)sc->result->files_hashed));
     cj_set(coverage, "files_read", cj_num((double)sc->result->files_read));
     cj_set(coverage, "files_defined", cj_num((double)files_defined));
@@ -769,6 +836,12 @@ static chutni_status scan_one_root(chutni_store *store, const chutni_root_info *
     sc.max_seconds = options ? options->max_seconds : 0;
     sc.started_ms = scan_monotonic_ms();
     sc.max_depth = effective_max_depth(root->policy_json, options, &sc.policy);
+    if ((!options || !options->max_file_size_bytes) &&
+        sc.policy.scan_max_file_size_bytes)
+        sc.max_bytes = sc.policy.scan_max_file_size_bytes;
+    sc.max_eligible_bytes = options && options->max_eligible_bytes
+                                ? options->max_eligible_bytes
+                                : sc.policy.max_eligible_bytes;
     result->deepest_directory_enumerated = 0;
 
     chutni_status status = prepare_producer(store, options, &sc);
@@ -849,7 +922,7 @@ chutni_status chutni_scan(chutni_store *store,
             deepest = result->deepest_directory_enumerated;
     }
     result->deepest_directory_enumerated = deepest;
-    result->complete_for_policy = result->errors == 0 && !result->partial;
+    result->complete_for_policy = scan_complete_for_policy(result);
     chutni_root_info_free(roots, root_count);
     return chutni_rebuild_indexes(store);
 }
@@ -915,7 +988,17 @@ chutni_status chutni_observe_directory(chutni_store *store, const char *source_i
                        : DEFAULT_MAX_FILE_BYTES;
     sc.progress_callback = options ? options->progress_callback : NULL;
     sc.progress_userdata = options ? options->progress_userdata : NULL;
+    sc.max_files = options ? options->max_files : 0;
+    sc.max_directories = options ? options->max_directories : 0;
+    sc.max_seconds = options ? options->max_seconds : 0;
+    sc.started_ms = scan_monotonic_ms();
     effective_max_depth(owner->policy_json, options, &sc.policy);
+    if ((!options || !options->max_file_size_bytes) &&
+        sc.policy.scan_max_file_size_bytes)
+        sc.max_bytes = sc.policy.scan_max_file_size_bytes;
+    sc.max_eligible_bytes = options && options->max_eligible_bytes
+                                ? options->max_eligible_bytes
+                                : sc.policy.max_eligible_bytes;
     /* Owned by this frame: `owner` points into `roots`, which is released
        before the walk begins. */
     char owner_root_id[CHUTNI_ID_STRLEN];
