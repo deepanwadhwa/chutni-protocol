@@ -679,6 +679,8 @@ static cj *tool_list_sources(const cj *arguments, int *is_error) {
         if (sources[i].state)
             cj_set(item, "state", cj_str(sources[i].state));
         cj_set(item, "size_bytes", cj_num((double)sources[i].size_bytes));
+        if (argument_bool(arguments, "include_identity", 0) && sources[i].content_hash)
+            cj_set(item, "content_hash", cj_str(sources[i].content_hash));
         cj_push(items, item);
         returned++;
     }
@@ -1349,6 +1351,15 @@ static cj *tool_put_model_artifact(const cj *arguments, int *is_error) {
     return result;
 }
 
+static cj *tool_put_file_outputs(const cj *arguments, int *is_error) {
+    chutni_store *store = NULL;
+    const char *path = argument_string(arguments, "store_path");
+    chutni_status status = path ? chutni_open(path, 0, &store) : CHUTNI_ERR_INVALID;
+    if (status != CHUTNI_OK) { *is_error = 1; return status_error("Cannot open output store", status, NULL); }
+    cj *result = jcall_dispatch(store, "put_file_outputs", arguments, is_error);
+    chutni_close(store); return result;
+}
+
 static cj *dispatch_tool(const char *name, const cj *arguments, int *is_error) {
     *is_error = 0;
     cj *empty = NULL;
@@ -1383,6 +1394,8 @@ static cj *dispatch_tool(const char *name, const cj *arguments, int *is_error) {
         result = tool_source_context(arguments, is_error);
     else if (name && !strcmp(name, "chutni_put_derived_artifact"))
         result = tool_put_derived_artifact(arguments, is_error);
+    else if (name && !strcmp(name, "chutni_put_file_outputs"))
+        result = tool_put_file_outputs(arguments, is_error);
     else if (name && !strcmp(name, "chutni_put_artifacts"))
         result = tool_put_artifacts(arguments, is_error);
     else if (name && !strcmp(name, "chutni_put_memory"))
@@ -1454,6 +1467,21 @@ static cj *tool_definition(const char *name, const char *title,
 static cj *tools_list(void) {
     cj *result = cj_obj();
     cj *tools = cj_arr();
+    {
+        cj *properties = cj_obj(), *outputs = cj_obj(), *item = cj_obj();
+        cj_set(properties, "store_path", schema_string("Absolute portable store path."));
+        cj_set(properties, "source_path", schema_string("Indexed source whose bytes produced these outputs."));
+        cj_set(properties, "source_content_hash", schema_string("Catalog BLAKE3 identity observed before extraction."));
+        cj_set(properties, "confirmed", schema_boolean("Host authorization to retain these outputs."));
+        cj_set(item, "type", cj_str("object"));
+        cj_set(outputs, "type", cj_str("array")); cj_set(outputs, "items", item);
+        cj_set(outputs, "minItems", cj_num(1)); cj_set(outputs, "maxItems", cj_num(128));
+        cj_set(properties, "outputs", outputs);
+        const char *required[] = {"store_path", "source_path", "source_content_hash", "confirmed", "outputs", NULL};
+        cj_push(tools, tool_definition("chutni_put_file_outputs", "Store one file's outputs",
+            "Verify one source version once and atomically retain parser/model outputs with individual provenance. Each output carries text, artifact_kind, operation, producer_name, app_name, app_version, and parser producer_version or model_id/model_revision.",
+            input_schema(properties, required), 0, 0, 1));
+    }
 
     {
         cj *properties = cj_obj();
@@ -1531,6 +1559,7 @@ static cj *tools_list(void) {
                schema_integer("Maximum number of file records returned.", 1, 200));
         cj_set(properties, "offset",
                schema_integer("Zero-based file-record offset for pagination.", 0, -1));
+        cj_set(properties, "include_identity", schema_boolean("Include catalog content hashes for native extraction hosts; false by default."));
         const char *required[] = {"store_path", "source_path", NULL};
         cj_push(tools, tool_definition(
             "chutni_list_sources", "List indexed Chutni files",
@@ -2090,6 +2119,17 @@ int main(int argc, char **argv) {
         return stdio_server();
     if (argc == 4 && !strcmp(argv[1], "--call"))
         return one_shot_call(argv[2], argv[3]);
+    if (argc == 4 && !strcmp(argv[1], "--call-file")) {
+        FILE *file = fopen(argv[3], "rb");
+        if (!file) return 2;
+        char *buffer = malloc((8 << 20) + 1);
+        if (!buffer) { fclose(file); return 2; }
+        size_t length = fread(buffer, 1, 8 << 20, file);
+        int valid = !ferror(file) && feof(file);
+        fclose(file); buffer[length] = 0;
+        int result = valid ? one_shot_call(argv[2], buffer) : 2;
+        free(buffer); return result;
+    }
     fprintf(stderr,
             "usage:\n"
             "  chutni-mcp [--stdio]\n"

@@ -3018,7 +3018,8 @@ chutni_status chutni_artifacts_put(
             return fail(s, CHUTNI_ERR_INVALID,
                         "generic submissions require source_content_hash for every artifact");
 
-    if (!sql_exec(s, "BEGIN IMMEDIATE")) return CHUTNI_ERR_DB;
+    int nested = !sqlite3_get_autocommit(s->db);
+    if (!sql_exec(s, nested ? "SAVEPOINT chutni_artifact_batch" : "BEGIN IMMEDIATE")) return CHUTNI_ERR_DB;
     chutni_status status =
         chutni_producer_put(s, producer, producer_id);
     if (status == CHUTNI_OK)
@@ -3030,13 +3031,14 @@ chutni_status chutni_artifacts_put(
         item.derivation_id = derivation_id;
         status = chutni_artifact_put(s, &item, artifact_ids[i]);
     }
-    if (status == CHUTNI_OK && sql_exec(s, "COMMIT"))
+    if (status == CHUTNI_OK && sql_exec(s, nested ? "RELEASE chutni_artifact_batch" : "COMMIT"))
         return CHUTNI_OK;
     if (status == CHUTNI_OK) status = CHUTNI_ERR_DB;
 
     char detail[ERRBUF];
     snprintf(detail, sizeof detail, "%s", chutni_last_error(s));
-    sql_exec(s, "ROLLBACK");
+    sql_exec(s, nested ? "ROLLBACK TO chutni_artifact_batch" : "ROLLBACK");
+    if (nested) sql_exec(s, "RELEASE chutni_artifact_batch");
     return fail(s, status, "%s",
                 detail[0] ? detail : chutni_strerror(status));
 }
@@ -5084,26 +5086,19 @@ static chutni_status jcall_source_snapshot_load(chutni_store *s, const cj *args,
                                                 jcall_source_snapshot *snap) {
     memset(snap, 0, sizeof *snap);
     if (!jcall_resolve_source(s, args, snap->source_id)) return CHUTNI_ERR_INVALID;
-    chutni_source_info *sources = NULL;
-    size_t count = 0;
-    chutni_status status = chutni_sources_list(s, NULL, &sources, &count);
-    if (status != CHUTNI_OK) return status;
-    int found = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (!sources[i].source_id || strcmp(sources[i].source_id, snap->source_id)) continue;
-        if (sources[i].display_path)
-            snprintf(snap->display_path, sizeof snap->display_path, "%s", sources[i].display_path);
-        if (sources[i].content_hash)
-            snprintf(snap->content_hash, sizeof snap->content_hash, "%s", sources[i].content_hash);
-        if (sources[i].media_type)
-            snprintf(snap->media_type, sizeof snap->media_type, "%s", sources[i].media_type);
-        if (sources[i].state)
-            snprintf(snap->state, sizeof snap->state, "%s", sources[i].state);
-        snap->size_bytes = sources[i].size_bytes;
-        found = 1;
-        break;
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(s->db, "SELECT json_extract(locator_json,'$.display_path'),content_hash,media_type,state,size_bytes FROM sources WHERE source_id=?1", -1, &q, NULL) != SQLITE_OK)
+        return fail(s, CHUTNI_ERR_DB, "%s", sqlite3_errmsg(s->db));
+    sqlite3_bind_text(q, 1, snap->source_id, -1, SQLITE_TRANSIENT);
+    int found = sqlite3_step(q) == SQLITE_ROW;
+    if (found) {
+#define SNAP_TEXT(column, field) do { const char *value = (const char *)sqlite3_column_text(q, column); if (value) snprintf(snap->field, sizeof snap->field, "%s", value); } while (0)
+        SNAP_TEXT(0, display_path); SNAP_TEXT(1, content_hash);
+        SNAP_TEXT(2, media_type); SNAP_TEXT(3, state);
+#undef SNAP_TEXT
+        snap->size_bytes = sqlite3_column_int64(q, 4);
     }
-    chutni_source_info_free(sources, count);
+    sqlite3_finalize(q);
     return found ? CHUTNI_OK : CHUTNI_ERR_NOTFOUND;
 }
 
@@ -5226,6 +5221,111 @@ static chutni_status jcall_op_put_artifacts(chutni_store *s, const cj *args, cj 
     free(artifact_ids);
     *out = result;
     return CHUTNI_OK;
+}
+
+/* Native hosts submit all outputs of one observed file together. Verify its
+   bytes once, preserve each output's provenance, and commit one transaction.
+   Unlike the compatibility model writer, this updates only affected FTS rows. */
+static cj *jcall_clone(const cj *value) {
+    char *text = cj_dump(value, -1);
+    cj *copy = text ? cj_parse(text, NULL) : NULL;
+    free(text); return copy;
+}
+static long long jcall_monotonic_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static chutni_status jcall_op_put_file_outputs(chutni_store *s, const cj *args, cj **out) {
+    long long started = jcall_monotonic_ms();
+    cj *outputs = cj_get(args, "outputs");
+    const char *expected = jarg_str(args, "source_content_hash");
+    if (!jarg_bool(args, "confirmed", 0) || !expected || !outputs ||
+        outputs->type != CJ_ARR || !outputs->n || outputs->n > 128)
+        return fail(s, CHUTNI_ERR_INVALID, "confirmed, source_content_hash and 1-128 outputs are required");
+    jcall_source_snapshot source;
+    chutni_status status = jcall_source_snapshot_load(s, args, &source);
+    if (status != CHUTNI_OK) return status;
+    char actual[CHUTNI_HASH_STRLEN];
+    const char *reason = "unknown";
+    if (!observe_source(s, source.source_id, actual, &reason) ||
+        strcmp(source.content_hash, expected) || strcmp(actual, expected))
+        return fail(s, CHUTNI_ERR_DENIED, "source_version_mismatch: file changed; rescan before saving outputs");
+    long long verified = jcall_monotonic_ms();
+    chutni_artifact_info *prior = NULL;
+    size_t prior_count = 0;
+    status = chutni_list_artifacts(s, source.source_id, &prior, &prior_count);
+    if (status != CHUTNI_OK) return status;
+    if (!sql_exec(s, "BEGIN IMMEDIATE")) {
+        chutni_artifact_info_free(prior, prior_count); return CHUTNI_ERR_DB;
+    }
+    int superseded = 0, reused_count = 0;
+    for (size_t i = 0; status == CHUTNI_OK && i < outputs->n; i++) {
+        cj *request = outputs->items[i];
+        const char *text = jarg_str(request, "text"), *kind = jarg_str(request, "artifact_kind");
+        const char *operation = jarg_str(request, "operation"), *name = jarg_str(request, "producer_name");
+        const char *model = jarg_str(request, "model_id"), *revision = jarg_str(request, "model_revision");
+        if (!text || !kind || !operation || !name || (model && !revision)) {
+            status = fail(s, CHUTNI_ERR_INVALID, "output text, kind, operation and producer identity are required"); break;
+        }
+        cj *selector = cj_get(request, "selector");
+        char *selector_text = selector ? cj_dump(selector, -1) : NULL;
+        const char *supersedes = NULL;
+        int reuse = 0;
+        for (size_t j = 0; j < prior_count; j++) {
+            chutni_artifact_info *p = &prior[j];
+            if (!p->status || strcmp(p->status, "active") || !p->artifact_kind || strcmp(p->artifact_kind, kind) ||
+                !p->producer_name || strcmp(p->producer_name, name) || !p->operation || strcmp(p->operation, operation) ||
+                !p->producer_kind || strcmp(p->producer_kind, model ? "model" : "parser") ||
+                (model && (!p->model_id || strcmp(p->model_id, model) || !p->model_revision || strcmp(p->model_revision, revision))) ||
+                ((selector_text || p->selector_json) && (!selector_text || !p->selector_json || strcmp(selector_text, p->selector_json)))) continue;
+            supersedes = p->artifact_id;
+            if (p->inline_text && !strcmp(p->inline_text, text) && p->source_content_hash && !strcmp(p->source_content_hash, expected)) {
+                reuse = 1; break;
+            }
+        }
+        free(selector_text);
+        if (reuse) { reused_count++; continue; }
+        cj *batch = cj_obj(), *producer = cj_obj(), *items = cj_arr(), *item = cj_obj(), *inputs = cj_arr(), *input = cj_obj();
+        cj_set(producer, "producer_kind", cj_str(model ? "model" : "parser"));
+        static const char *keys[] = {"runtime", "app_name", "app_version", "model_id", "model_revision", NULL};
+        for (const char **key = keys; *key; key++) {
+            const char *value = jarg_str(request, *key); if (value) cj_set(producer, *key, cj_str(value));
+        }
+        cj_set(producer, "name", cj_str(name));
+        const char *version = jarg_str(request, "producer_version");
+        if (version) cj_set(producer, "version", cj_str(version));
+        cj_set(batch, "producer", producer);
+        cj_set(batch, "operation", cj_str(operation));
+        cj *recipe = cj_get(request, "recipe_hash"), *parameters = cj_get(request, "parameters");
+        if (recipe) cj_set(batch, "recipe_hash", jcall_clone(recipe));
+        if (parameters) cj_set(batch, "parameters", jcall_clone(parameters));
+        cj_set(input, "source_id", cj_str(source.source_id));
+        cj_set(input, "source_content_hash", cj_str(expected));
+        cj_push(inputs, input); cj_set(batch, "inputs", inputs);
+        cj_set(item, "source_id", cj_str(source.source_id));
+        cj_set(item, "source_content_hash", cj_str(expected));
+        cj_set(item, "text", cj_str(text)); cj_set(item, "artifact_kind", cj_str(kind));
+        cj_set(item, "artifact_origin", cj_str(model ? "model_generated" : "deterministic_transform"));
+        if (selector) cj_set(item, "selector", jcall_clone(selector));
+        if (supersedes) { cj_set(item, "supersedes_artifact_id", cj_str(supersedes)); superseded = 1; }
+        cj_push(items, item); cj_set(batch, "artifacts", items);
+        cj *written = NULL; status = jcall_op_put_artifacts(s, batch, &written);
+        cj_free(written); cj_free(batch);
+    }
+    chutni_artifact_info_free(prior, prior_count);
+    if (status == CHUTNI_OK && superseded) { char now[32]; iso_now(now); cascade_stale_dependents(s, now); }
+    if (status == CHUTNI_OK && sql_exec(s, "COMMIT")) {
+        cj *result = cj_obj(); cj_set(result, "ok", cj_bool(1));
+        cj_set(result, "outputs_written", cj_num((double)(outputs->n - reused_count)));
+        cj_set(result, "outputs_reused", cj_num(reused_count));
+        cj_set(result, "source_verifications", cj_num(1));
+        cj_set(result, "verification_milliseconds", cj_num((double)(verified - started)));
+        cj_set(result, "commit_milliseconds", cj_num((double)(jcall_monotonic_ms() - verified)));
+        *out = result; return CHUTNI_OK;
+    }
+    if (status == CHUTNI_OK) status = CHUTNI_ERR_DB;
+    char detail[ERRBUF]; snprintf(detail, sizeof detail, "%s", chutni_last_error(s));
+    sql_exec(s, "ROLLBACK"); return fail(s, status, "%s", detail);
 }
 
 static chutni_status jcall_op_put_memory(chutni_store *s, const cj *args,
@@ -5624,6 +5724,8 @@ chutni_status chutni_call(chutni_store *s, const char *operation,
         status = jcall_op_source_context(s, args, &out);
     } else if (!strcmp(operation, "add_source")) {
         status = jcall_op_add_source(s, args, &out);
+    } else if (!strcmp(operation, "put_file_outputs")) {
+        status = jcall_op_put_file_outputs(s, args, &out);
     } else if (!strcmp(operation, "put_artifacts")) {
         status = jcall_op_put_artifacts(s, args, &out);
     } else if (!strcmp(operation, "put_memory")) {

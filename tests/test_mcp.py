@@ -155,6 +155,7 @@ def main():
             "chutni_source_context",
             "chutni_put_derived_artifact",
             "chutni_put_artifacts",
+            "chutni_put_file_outputs",
             "chutni_put_memory",
             "chutni_put_model_artifact",
         }
