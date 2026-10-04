@@ -53,6 +53,7 @@ typedef struct {
     uint64_t max_bytes;
     uint64_t max_eligible_bytes;
     uint64_t eligible_bytes;
+    int metadata_only;
     chutni_scan_progress_callback progress_callback;
     void *progress_userdata;
     uint64_t max_files;
@@ -236,7 +237,7 @@ static void scan_file(scan_context *sc, const char *path, int depth,
     }
 
     int need_metadata = 1;
-    int need_text = looks_texty(path) && size_bytes > 0;
+    int need_text = !sc->metadata_only && looks_texty(path) && size_bytes > 0;
     if (!changed) {
         sc->result->unchanged++;
         chutni_artifact_info *existing = NULL;
@@ -831,6 +832,7 @@ static chutni_status scan_one_root(chutni_store *store, const chutni_root_info *
                        : DEFAULT_MAX_FILE_BYTES;
     sc.progress_callback = options ? options->progress_callback : NULL;
     sc.progress_userdata = options ? options->progress_userdata : NULL;
+    sc.metadata_only = options ? options->metadata_only : 0;
     sc.max_files = options ? options->max_files : 0;
     sc.max_directories = options ? options->max_directories : 0;
     sc.max_seconds = options ? options->max_seconds : 0;
@@ -993,6 +995,7 @@ chutni_status chutni_observe_directory(chutni_store *store, const char *source_i
     sc.max_seconds = options ? options->max_seconds : 0;
     sc.started_ms = scan_monotonic_ms();
     effective_max_depth(owner->policy_json, options, &sc.policy);
+    sc.metadata_only = options ? options->metadata_only : 0;
     if ((!options || !options->max_file_size_bytes) &&
         sc.policy.scan_max_file_size_bytes)
         sc.max_bytes = sc.policy.scan_max_file_size_bytes;

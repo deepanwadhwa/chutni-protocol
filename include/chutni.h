@@ -419,6 +419,9 @@ typedef struct {
     /* Total bytes admitted to the scan, counting only files under
        max_file_size_bytes. Zero leaves the reference API unbounded. */
     uint64_t max_eligible_bytes;
+    /* Hosts may extract bounded samples themselves after cataloging. This
+       suppresses whole-file text artifacts, but retains identity hashing. */
+    int metadata_only;
 } chutni_scan_options;
 
 typedef struct chutni_scan_result {

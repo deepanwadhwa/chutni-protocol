@@ -490,6 +490,7 @@ static cj *tool_folder_activate(const cj *arguments, int *is_error) {
     memset(&options, 0, sizeof options);
     options.app_name = argument_string(arguments, "app_name");
     options.app_version = argument_string(arguments, "app_version");
+    options.metadata_only = argument_bool(arguments, "metadata_only", 0);
     cj *max_value = cj_get(arguments, "max_file_size_bytes");
     if (max_value && max_value->type == CJ_NUM && max_value->num > 0)
         options.max_file_size_bytes = (uint64_t)max_value->num;
