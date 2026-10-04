@@ -1529,7 +1529,11 @@ static void scenario_safe_folder_policy(void) {
     p(store_path, sizeof store_path, "safe-policy.chutni");
     make_dir(tree);
 
-    const char *generated[] = { ".venv", "NODE_MODULES", "build", NULL };
+    const char *generated[] = {
+        ".venv", "NODE_MODULES", "build", "Editor.app", "Upper.APP",
+        "Resources.bundle", "Runtime.framework", "Extension.plugin",
+        "Project.xcodeproj", "Workspace.xcworkspace", "Pictures.photoslibrary", NULL
+    };
     for (const char **name = generated; *name; name++) {
         snprintf(path, sizeof path, "%s/%s", tree, *name);
         make_dir(path);
@@ -1601,6 +1605,53 @@ static void scenario_safe_folder_policy(void) {
           "eligible neighbor remains indexed");
     check("19 symlink escapes and cycles remain unfollowed",
           link_absent, "stored follow_symlinks cannot relax the safety rule");
+    /* Simulate entries left by an older scanner, then verify a new scan
+       excludes both their parent and descendants without admitting them. */
+    char root_source[CHUTNI_ID_STRLEN], package[CHUTNI_ID_STRLEN], old_file[CHUTNI_ID_STRLEN];
+    int seeded = chutni_source_find(store, tree, root_source) == CHUTNI_OK;
+    snprintf(path, sizeof path, "%s/Editor.app", tree);
+    seeded = seeded && chutni_directory_put(store, root_id, path, root_source,
+                                             NULL, 1, package) == CHUTNI_OK;
+    snprintf(path, sizeof path, "%s/Editor.app/decoy.md", tree);
+    seeded = seeded && chutni_source_put(store, root_id, path, 1, old_file, NULL) == CHUTNI_OK &&
+        chutni_source_set_parent(store, old_file, package, 2) == CHUTNI_OK;
+    char old_derivation[CHUTNI_ID_STRLEN], old_artifact[CHUTNI_ID_STRLEN], old_hash[CHUTNI_HASH_STRLEN];
+    const char *old_text = "decoy from generated output\n";
+    chutni_hash_bytes(old_text, strlen(old_text), old_hash);
+    chutni_artifact artifact;
+    memset(&artifact, 0, sizeof artifact);
+    artifact.source_id = old_file;
+    artifact.artifact_kind = "extracted_text";
+    artifact.artifact_origin = "deterministic_transform";
+    artifact.inline_text = "legacy package sentinel";
+    artifact.source_content_hash = old_hash;
+    artifact.derivation_id = old_derivation;
+    seeded = seeded && parser_derivation(store, "extract_text", old_derivation) &&
+        chutni_artifact_put(store, &artifact, old_artifact) == CHUTNI_OK;
+    if (!seeded) fprintf(stderr, "legacy package fixture setup: %s\n", chutni_last_error(store));
+    status = chutni_scan(store, &options, &result);
+    chutni_source_info *sources = NULL;
+    size_t source_count = 0;
+    int excluded_legacy = 0;
+    if (seeded && chutni_sources_list(store, root_id, &sources, &source_count) == CHUTNI_OK) {
+        for (size_t i = 0; i < source_count; i++)
+            if ((!strcmp(sources[i].source_id, package) || !strcmp(sources[i].source_id, old_file)) &&
+                sources[i].state && !strcmp(sources[i].state, "excluded")) excluded_legacy++;
+    }
+    chutni_source_info_free(sources, source_count);
+    check("19 old package descendants are excluded through catalog hierarchy",
+          seeded && status == CHUTNI_OK && result.files_seen == 1 && excluded_legacy == 2,
+          "new scan processes only the ordinary neighboring document");
+    chutni_search_request request;
+    memset(&request, 0, sizeof request);
+    request.query = "legacy package sentinel";
+    chutni_search_result *hits = NULL;
+    size_t hit_count = 0;
+    status = chutni_search(store, &request, &hits, &hit_count);
+    check("19 excluded legacy package content is not searchable",
+          seeded && status == CHUTNI_OK && hit_count == 0,
+          "excluded source entries cannot leak back into ordinary retrieval");
+    chutni_search_result_free(hits, hit_count);
     chutni_close(store);
 }
 

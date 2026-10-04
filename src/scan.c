@@ -329,6 +329,26 @@ done:
    knows nothing about grandchildren it never looked at, and marking those
    missing would be inventing an observation. Reconciliation therefore runs
    per enumerated directory and considers only that directory's own children. */
+/* Policy excludes an entire subtree. Retire previously admitted descendants
+   from catalog hierarchy alone; never enumerate or open that subtree. */
+static void exclude_known_descendants(scan_context *sc, const char *directory_id,
+                                      int depth) {
+    if (depth >= MAX_WALK_DEPTH) { sc->result->errors++; return; }
+    chutni_source_info *children = NULL;
+    size_t count = 0;
+    if (chutni_list_children(sc->store, directory_id, &children, &count) != CHUTNI_OK) {
+        sc->result->errors++; return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (chutni_source_set_state(sc->store, children[i].source_id,
+                                    CHUTNI_SOURCE_EXCLUDED) != CHUTNI_OK)
+            sc->result->errors++;
+        if (children[i].source_kind && !strcmp(children[i].source_kind, "directory"))
+            exclude_known_descendants(sc, children[i].source_id, depth + 1);
+    }
+    chutni_source_info_free(children, count);
+}
+
 static void reconcile_children(scan_context *sc, const char *dir_source_id,
                                const char *dir_path,
                                const chutni_dir_entry *entries, size_t count) {
@@ -358,6 +378,9 @@ static void reconcile_children(scan_context *sc, const char *dir_source_id,
                         ? CHUTNI_SOURCE_EXCLUDED
                         : CHUTNI_SOURCE_UNSUPPORTED;
 
+        if (state == CHUTNI_SOURCE_EXCLUDED && known[i].source_kind &&
+            !strcmp(known[i].source_kind, "directory"))
+            exclude_known_descendants(sc, known[i].source_id, 0);
         if (known[i].state && !strcmp(known[i].state,
                                       chutni_source_state_name(state)))
             continue;

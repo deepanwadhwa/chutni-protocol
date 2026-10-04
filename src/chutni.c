@@ -1571,6 +1571,18 @@ static int excluded_entry_name(const char *name,
     };
     for (const char **p = skip; *p; p++)
         if (!strcasecmp(name, *p)) return 1;
+    /* Match the host's metadata inventory before enumerating packaged
+       applications, generated IDE containers, or private library trees. */
+    static const char *packages[] = {
+        ".app", ".bundle", ".framework", ".plugin", ".xcodeproj",
+        ".xcworkspace", ".photoslibrary", NULL
+    };
+    size_t length = strlen(name);
+    for (const char **p = packages; *p; p++) {
+        size_t suffix_length = strlen(*p);
+        if (length > suffix_length &&
+            !strcasecmp(name + length - suffix_length, *p)) return 1;
+    }
     if (policy && policy->exclude_globs) {
         for (const char *const *p = policy->exclude_globs; *p; p++) {
             /* Exact user names follow the app's conservative case-insensitive
@@ -2217,6 +2229,7 @@ static int observe_source(chutni_store *s, const char *source_id,
     }
     sqlite3_finalize(q);
     if (!found) { *state = "unknown"; return 0; }
+    if (!strcmp(stored_state, "excluded")) { *state = "unknown"; return 0; }
 
     /* A standalone memory is born inside Chutni; there is no external file to
        stat. Re-hash the active memory artifact itself so check_freshness still
@@ -4153,7 +4166,7 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
         "       snippet(artifacts_fts, 4, '', '', '…', 12),"
         "       bm25(artifacts_fts),"
         "       a.status, a.source_content_hash, a.selector_json, s.content_hash, s.media_type,"
-        "       d.producer_id, s.size_bytes, s.mtime_ns, s.source_kind"
+        "       d.producer_id, s.size_bytes, s.mtime_ns, s.source_kind, s.state"
         " FROM idx.artifacts_fts"
         " JOIN artifacts a ON a.artifact_id=artifacts_fts.artifact_id"
         " JOIN sources s ON s.source_id=a.source_id"
@@ -4175,6 +4188,9 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
     while ((rc = sqlite3_step(q)) == SQLITE_ROW && (int)n < limit) {
         const char *status = (const char *)sqlite3_column_text(q, 6);
         if (!req->include_stale && status && strcmp(status, "active")) continue;
+        const char *source_state = (const char *)sqlite3_column_text(q, 15);
+        int excluded_source = source_state && !strcmp(source_state, "excluded");
+        if (excluded_source && !req->include_stale) continue;
 
         const char *kind = (const char *)sqlite3_column_text(q, 3);
         if (kind && !str_in_list(kind, req->artifact_kinds)) continue;
@@ -4204,7 +4220,7 @@ chutni_status chutni_search(chutni_store *s, const chutni_search_request *req,
         r->score = -sqlite3_column_double(q, 5);
         r->score_type = strdup("bm25_fts5_negated");
 
-        r->freshness = strdup(search_freshness(
+        r->freshness = strdup(excluded_source ? "unknown" : search_freshness(
             status,
             (const char *)sqlite3_column_text(q, 7),
             (const char *)sqlite3_column_text(q, 9),
